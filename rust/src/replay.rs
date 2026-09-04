@@ -149,6 +149,9 @@ fn ensure_base_cached(
             .clone();
         let authored = compute_authored_tree(&base, patch);
 
+        // Sub-replay warnings are intentionally discarded: this computes an
+        // intermediate base tree, not the target. The main replay loop re-integrates
+        // the same patches and captures the authoritative warnings for the target version.
         let mut sub_warnings: BTreeSet<(String, String)> = BTreeSet::new();
         integrate_patch(patch, &base, &mut canonical, &authored, &mut sub_warnings)?;
 
@@ -1346,6 +1349,21 @@ mod proptests {
         )
     }
 
+    fn arb_shuffled_patch_set() -> impl Strategy<Value = (Vec<Patch>, Vec<Patch>, Version)> {
+        arb_simple_patch_set().prop_flat_map(|(patches, target)| {
+            let len = patches.len();
+            let patches2 = patches.clone();
+            proptest::collection::vec(proptest::num::usize::ANY, len).prop_map(move |noise| {
+                let mut shuffled = patches2.clone();
+                for i in (1..shuffled.len()).rev() {
+                    let j = noise[i] % (i + 1);
+                    shuffled.swap(i, j);
+                }
+                (patches.clone(), shuffled, target.clone())
+            })
+        })
+    }
+
     proptest! {
         #[test]
         fn replay_is_pure((patches, target) in arb_simple_patch_set()) {
@@ -1359,6 +1377,14 @@ mod proptests {
         fn replay_produces_nonempty_tree_for_nonempty_patches((patches, target) in arb_simple_patch_set()) {
             let result = replay(&patches, &target).unwrap();
             prop_assert!(!result.tree.is_empty());
+        }
+
+        #[test]
+        fn replay_input_order_independent((original, shuffled, target) in arb_shuffled_patch_set()) {
+            let r1 = replay(&original, &target).unwrap();
+            let r2 = replay(&shuffled, &target).unwrap();
+            prop_assert_eq!(r1.tree, r2.tree, "tree must be identical regardless of input order");
+            prop_assert_eq!(r1.warnings, r2.warnings, "warnings must be identical regardless of input order");
         }
     }
 }
