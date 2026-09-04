@@ -10,5 +10,8 @@ dist/
 target/
 Cargo.lock
 
+# Nix / direnv
+.direnv/
+
 # Scratch / local issues
 .scratch/

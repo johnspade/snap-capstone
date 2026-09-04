@@ -1,0 +1,32 @@
+[package]
+name = "snap"
+version = "0.1.0"
+edition = "2024"
+description = "Snap"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "snap"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_imports = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+fn_params_excessive_bools = "deny"
+str_to_string = "deny"
+rest_pat_in_fully_bound_structs = "deny"
+unused_async = "allow"
+module_name_repetitions = "allow"
+multiple_crate_versions = "allow"
+collapsible_if = "allow"
+collapsible_match = "allow"
