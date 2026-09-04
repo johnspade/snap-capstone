@@ -45,7 +45,7 @@ fn run<O: std::io::Write, E: std::io::Write>(
         ["log"] => commands::log(writer),
         ["commit", msg] => commands::commit(writer, msg),
         ["revert", arg] if !arg.starts_with('-') => commands::revert(writer, arg),
-        ["merge", arg] if !arg.starts_with('-') => commands::require_repo_stub("merge"),
+        ["merge", arg] if !arg.starts_with('-') => commands::merge(writer, arg),
         ["diff"] => commands::diff_working(writer),
         ["diff", old, new] => commands::diff_versions(writer, old, new),
         ["diff", old, new, "--repo", repo] => commands::diff_cross_repo(writer, old, new, repo),

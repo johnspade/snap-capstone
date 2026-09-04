@@ -14,6 +14,10 @@ impl<O: Write, E: Write> Writer<O, E> {
         let _ = self.stdout.write_all(msg.as_bytes());
     }
 
+    pub fn stderr(&mut self, msg: &str) {
+        let _ = self.stderr.write_all(msg.as_bytes());
+    }
+
     pub fn error(&mut self, detail: &str) {
         let _ = writeln!(self.stderr, "snap: {detail}");
     }
