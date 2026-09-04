@@ -1,0 +1,414 @@
+#![cfg(not(miri))]
+
+use std::path::Path;
+use std::process::Command;
+
+fn snap_bin() -> std::path::PathBuf {
+    let mut path = std::env::current_exe().unwrap();
+    path.pop(); // remove test binary name
+    path.pop(); // remove deps/
+    path.push("snap");
+    path
+}
+
+struct Sandbox {
+    dir: tempfile::TempDir,
+}
+
+impl Sandbox {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("home")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp")).unwrap();
+        Self { dir }
+    }
+
+    fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        let output = Command::new(snap_bin())
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.dir.path().join("home"))
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap();
+        Output {
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            exit_code: output.status.code().unwrap(),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.run_in(self.dir.path(), args)
+    }
+
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+struct Output {
+    stdout: String,
+    stderr: String,
+    exit_code: i32,
+}
+
+// ── --version ──────────────────────────────────────────────────────
+
+#[test]
+fn version_prints_semver() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["--version"]);
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.starts_with("snap "), "stdout: {:?}", out.stdout);
+    let version = out.stdout.trim().strip_prefix("snap ").unwrap();
+    assert!(version.split('.').count() == 3, "not semver: {version}");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn version_rejects_extra_args() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["--version", "extra"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+// ── init ───────────────────────────────────────────────────────────
+
+#[test]
+fn init_creates_empty_repo() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let out = sb.run_in(&repo, &["init"]);
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "()\n");
+    assert_eq!(out.stderr, "");
+
+    let repo_json = std::fs::read_to_string(repo.join(".snap/repository.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&repo_json).unwrap();
+    assert_eq!(parsed["format"], 1);
+    assert_eq!(parsed["frontier"], serde_json::json!([]));
+    assert_eq!(parsed["patches"], serde_json::json!([]));
+}
+
+#[test]
+fn init_preserves_existing_files() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("existing.txt"), "keep me\n").unwrap();
+
+    let out = sb.run_in(&repo, &["init"]);
+    assert_eq!(out.exit_code, 0);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("existing.txt")).unwrap(),
+        "keep me\n"
+    );
+}
+
+#[test]
+fn init_rejects_reinit() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+
+    let out = sb.run_in(&repo, &["init"]);
+    assert_eq!(out.exit_code, 0);
+
+    let out = sb.run_in(&repo, &["init"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("repository already exists"),
+        "stderr: {:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn init_rejects_nesting() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let child = repo.join("child");
+    std::fs::create_dir(&child).unwrap();
+
+    let out = sb.run_in(&child, &["init"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("cannot initialize inside repository"),
+        "stderr: {:?}",
+        out.stderr
+    );
+    assert!(!child.join(".snap").exists());
+}
+
+#[test]
+fn init_with_path_creates_repo() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["init", "new/repository"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "()\n");
+    assert!(
+        sb.path()
+            .join("new/repository/.snap/repository.json")
+            .exists()
+    );
+}
+
+#[test]
+fn init_rejects_extra_args() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["init", "a", "b"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+#[test]
+fn init_rejects_unknown_flag() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["init", "--unknown"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+    assert!(!sb.path().join("--unknown").exists());
+}
+
+// ── config ─────────────────────────────────────────────────────────
+
+#[test]
+fn config_global_writes_snapconfig() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["config", "--global", "contributor.id", "global@example.com"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "");
+
+    let path = sb.path().join("home/.snapconfig.json");
+    let content = std::fs::read_to_string(path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"contributor": {"id": "global@example.com"}})
+    );
+}
+
+#[test]
+fn config_local_writes_in_repo() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["config", "contributor.id", "local@example.com"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "");
+
+    let path = repo.join(".snap/config.json");
+    let content = std::fs::read_to_string(path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(
+        parsed,
+        serde_json::json!({"contributor": {"id": "local@example.com"}})
+    );
+}
+
+#[test]
+fn config_rejects_invalid_id() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["config", "contributor.id", "bad-id"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert!(
+        out.stderr.contains("invalid contributor id"),
+        "stderr: {:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn config_local_requires_repo() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["config", "contributor.id", "a@x"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(
+        out.stderr.contains("not a Snap repository"),
+        "stderr: {:?}",
+        out.stderr
+    );
+}
+
+#[test]
+fn config_global_after_positionals_is_invalid() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["config", "contributor.id", "a@x", "--global"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+#[test]
+fn config_duplicate_global_is_invalid() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(
+        &repo,
+        &["config", "--global", "--global", "contributor.id", "a@x"],
+    );
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+#[test]
+fn config_overwrites_and_strips_unknown_fields() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let config_path = repo.join(".snap/config.json");
+    std::fs::write(
+        &config_path,
+        r#"{"contributor":{"id":"old@x"},"unknown":true}"#,
+    )
+    .unwrap();
+
+    let out = sb.run_in(&repo, &["config", "contributor.id", "new@x"]);
+    assert_eq!(out.exit_code, 0);
+
+    let content = std::fs::read_to_string(config_path).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(parsed, serde_json::json!({"contributor": {"id": "new@x"}}));
+}
+
+// ── unknown commands ───────────────────────────────────────────────
+
+#[test]
+fn unknown_command_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["unknown"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+#[test]
+fn no_args_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run(&[]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+// ── repo-requiring commands without repo ───────────────────────────
+
+#[test]
+fn status_without_repo_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["status"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "snap: not a Snap repository\n");
+}
+
+#[test]
+fn log_without_repo_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["log"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("not a Snap repository"));
+}
+
+// ── diff usage message ─────────────────────────────────────────────
+
+#[test]
+fn diff_wrong_arg_count_shows_usage() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["diff", "()"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("usage: snap diff"));
+}
+
+#[test]
+fn diff_extra_args_shows_usage() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["diff", "()", "()", "--unknown", "repo"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("usage: snap diff"));
+}
+
+// ── --serve grammar ────────────────────────────────────────────────
+
+#[test]
+fn serve_extra_args_is_invalid() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["--serve", "0", "extra"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: invalid command or arguments\n");
+}
+
+// ── init finds repo in parent directories ──────────────────────────
+
+#[test]
+fn init_detects_repo_in_grandparent() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let deep = repo.join("a/b/c");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    let out = sb.run_in(&deep, &["init"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("cannot initialize inside repository"));
+}
+
+// ── config from subdirectory finds repo ────────────────────────────
+
+#[test]
+fn config_from_subdirectory_finds_repo() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let sub = repo.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+
+    let out = sb.run_in(&sub, &["config", "contributor.id", "a@x"]);
+    assert_eq!(out.exit_code, 0);
+
+    let config = std::fs::read_to_string(repo.join(".snap/config.json")).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
+    assert_eq!(parsed["contributor"]["id"], "a@x");
+}
