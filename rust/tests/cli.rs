@@ -366,6 +366,193 @@ fn diff_extra_args_shows_usage() {
     assert!(out.stderr.contains("usage: snap diff"));
 }
 
+// ── diff two versions ─────────────────────────────────────────────
+
+fn setup_two_version_repo(sb: &Sandbox) -> std::path::PathBuf {
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "old\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+    std::fs::write(repo.join("f.txt"), "new\n").unwrap();
+    sb.run_in(&repo, &["commit", "second"]);
+    repo
+}
+
+#[test]
+fn diff_two_versions_shows_changes() {
+    let sb = Sandbox::new();
+    let repo = setup_two_version_repo(&sb);
+    let out = sb.run_in(&repo, &["diff", "(a@x->1)", "(a@x->2)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stderr, "");
+    assert!(out.stdout.contains("--- a/f.txt\n+++ b/f.txt\n"));
+    assert!(out.stdout.contains("-old\n"));
+    assert!(out.stdout.contains("+new\n"));
+}
+
+#[test]
+fn diff_same_version_no_output() {
+    let sb = Sandbox::new();
+    let repo = setup_two_version_repo(&sb);
+    let out = sb.run_in(&repo, &["diff", "(a@x->1)", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn diff_empty_to_version() {
+    let sb = Sandbox::new();
+    let repo = setup_two_version_repo(&sb);
+    let out = sb.run_in(&repo, &["diff", "()", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stderr, "");
+    assert!(out.stdout.contains("--- /dev/null\n+++ b/f.txt\n"));
+    assert!(out.stdout.contains("+old\n"));
+}
+
+#[test]
+fn diff_version_to_empty() {
+    let sb = Sandbox::new();
+    let repo = setup_two_version_repo(&sb);
+    let out = sb.run_in(&repo, &["diff", "(a@x->1)", "()"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stderr, "");
+    assert!(out.stdout.contains("--- a/f.txt\n+++ /dev/null\n"));
+    assert!(out.stdout.contains("-old\n"));
+}
+
+#[test]
+fn diff_unknown_version_fails() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    let out = sb.run_in(&repo, &["diff", "(unknown@x->1)", "()"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("unknown version"));
+}
+
+#[test]
+fn diff_invalid_version_syntax_fails() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    let out = sb.run_in(&repo, &["diff", "not-a-version", "()"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("invalid version"));
+}
+
+// ── diff cross-repo ───────────────────────────────────────────────
+
+#[test]
+fn diff_cross_repo_shows_changes() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::create_dir(&remote).unwrap();
+
+    sb.run_in(&local, &["init"]);
+    sb.run_in(&local, &["config", "contributor.id", "a@x"]);
+    std::fs::write(local.join("f.txt"), "local\n").unwrap();
+    sb.run_in(&local, &["commit", "local"]);
+
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "b@y"]);
+    std::fs::write(remote.join("g.txt"), "remote\n").unwrap();
+    sb.run_in(&remote, &["commit", "remote"]);
+
+    let out = sb.run_in(
+        &local,
+        &[
+            "diff",
+            "(a@x->1)",
+            "(b@y->1)",
+            "--repo",
+            remote.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stderr, "");
+    assert!(out.stdout.contains("--- a/f.txt\n+++ /dev/null\n"));
+    assert!(out.stdout.contains("--- /dev/null\n+++ b/g.txt\n"));
+}
+
+#[test]
+fn diff_cross_repo_dot_collision_fails() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::create_dir(&remote).unwrap();
+
+    sb.run_in(&local, &["init"]);
+    sb.run_in(&local, &["config", "contributor.id", "a@x"]);
+    std::fs::write(local.join("f.txt"), "local\n").unwrap();
+    sb.run_in(&local, &["commit", "local"]);
+
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "a@x"]);
+    std::fs::write(remote.join("f.txt"), "different\n").unwrap();
+    sb.run_in(&remote, &["commit", "different"]);
+
+    let out = sb.run_in(
+        &local,
+        &["diff", "()", "(a@x->1)", "--repo", remote.to_str().unwrap()],
+    );
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("patch collision"));
+    assert_eq!(out.stdout, "");
+}
+
+#[test]
+fn diff_cross_repo_not_a_repo_fails() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let out = sb.run_in(&local, &["diff", "()", "()", "--repo", "/nonexistent"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("not a Snap repository"));
+}
+
+#[test]
+fn diff_cross_repo_shared_dots_identical_ok() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::create_dir(&remote).unwrap();
+
+    sb.run_in(&local, &["init"]);
+    sb.run_in(&local, &["config", "contributor.id", "a@x"]);
+    std::fs::write(local.join("f.txt"), "shared\n").unwrap();
+    sb.run_in(&local, &["commit", "shared"]);
+
+    let local_repo = std::fs::read_to_string(local.join(".snap/repository.json")).unwrap();
+    std::fs::create_dir(remote.join(".snap")).unwrap();
+    std::fs::write(remote.join(".snap/repository.json"), &local_repo).unwrap();
+
+    let out = sb.run_in(
+        &local,
+        &[
+            "diff",
+            "(a@x->1)",
+            "(a@x->1)",
+            "--repo",
+            remote.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "");
+    assert_eq!(out.stderr, "");
+}
+
 // ── --serve grammar ────────────────────────────────────────────────
 
 #[test]
