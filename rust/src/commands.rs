@@ -103,7 +103,8 @@ pub fn log<O: std::io::Write, E: std::io::Write>(
     let repo_root = require_repo()?;
     let repo = load_repo(&repo_root)?;
 
-    let order = integration_order(&repo.patches)?;
+    let order =
+        replay::canonical_order(&repo.patches).map_err(|e| SnapError::Internal(e.to_string()))?;
 
     for &idx in order.iter().rev() {
         let patch = &repo.patches[idx];
@@ -369,55 +370,6 @@ fn escape_log_message(message: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn integration_order(patches: &[Patch]) -> Result<Vec<usize>, SnapError> {
-    let n = patches.len();
-    let mut integrated = vec![false; n];
-    let mut order = Vec::with_capacity(n);
-
-    for _ in 0..n {
-        let mut ready: Option<usize> = None;
-        for (idx, patch) in patches.iter().enumerate() {
-            if integrated[idx] {
-                continue;
-            }
-            let base_satisfied = patch.base.components().iter().all(|(id, rev)| {
-                (1..=*rev).all(|r| {
-                    patches
-                        .iter()
-                        .enumerate()
-                        .any(|(j, p)| integrated[j] && p.author == *id && p.revision == r)
-                })
-            });
-            if !base_satisfied {
-                continue;
-            }
-            match ready {
-                None => ready = Some(idx),
-                Some(prev_idx) => {
-                    let prev_result = patches[prev_idx].result_version();
-                    let curr_result = patch.result_version();
-                    if curr_result.snap_cmp(&prev_result) == std::cmp::Ordering::Less {
-                        ready = Some(idx);
-                    }
-                }
-            }
-        }
-        match ready {
-            Some(idx) => {
-                integrated[idx] = true;
-                order.push(idx);
-            }
-            None => {
-                return Err(SnapError::Internal(
-                    "cyclic or missing dependency in patch history".to_owned(),
-                ));
-            }
-        }
-    }
-
-    Ok(order)
-}
-
 fn atomic_write_repo(repo_root: &Path, repo: &Repository) -> Result<(), SnapError> {
     let json = repository::serialize(repo);
     let snap_dir = repo_root.join(".snap");
@@ -459,10 +411,7 @@ fn format_diff_deletion<O: std::io::Write, E: std::io::Write>(
         writer.stdout(&format!("--- a/{path}\n+++ /dev/null\n"));
         writer.stdout(&format!("@@ -1,{} +1,0 @@\n", tokens.len()));
         for token in &tokens {
-            writer.stdout(&format!("-{token}"));
-            if !token.ends_with('\n') {
-                writer.stdout("\n\\ No newline at end of file\n");
-            }
+            write_diff_token(writer, '-', token);
         }
     } else {
         writer.stdout(&format!("Binary files a/{path} and /dev/null differ\n"));
@@ -502,10 +451,7 @@ fn format_diff_tokens_inserted<O: std::io::Write, E: std::io::Write>(
     tokens: &[&str],
 ) {
     for token in tokens {
-        writer.stdout(&format!("+{token}"));
-        if !token.ends_with('\n') {
-            writer.stdout("\n\\ No newline at end of file\n");
-        }
+        write_diff_token(writer, '+', token);
     }
 }
 
@@ -519,31 +465,33 @@ fn format_unified_edit<O: std::io::Write, E: std::io::Write>(
         match op {
             text::EditOp::Retain(n) => {
                 for token in &old_tokens[old_pos..old_pos + n] {
-                    writer.stdout(&format!(" {token}"));
-                    if !token.ends_with('\n') {
-                        writer.stdout("\n\\ No newline at end of file\n");
-                    }
+                    write_diff_token(writer, ' ', token);
                 }
                 old_pos += n;
             }
             text::EditOp::Delete(n) => {
                 for token in &old_tokens[old_pos..old_pos + n] {
-                    writer.stdout(&format!("-{token}"));
-                    if !token.ends_with('\n') {
-                        writer.stdout("\n\\ No newline at end of file\n");
-                    }
+                    write_diff_token(writer, '-', token);
                 }
                 old_pos += n;
             }
             text::EditOp::Insert(tokens) => {
                 for token in tokens {
-                    writer.stdout(&format!("+{token}"));
-                    if !token.ends_with('\n') {
-                        writer.stdout("\n\\ No newline at end of file\n");
-                    }
+                    write_diff_token(writer, '+', token);
                 }
             }
         }
+    }
+}
+
+fn write_diff_token<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    prefix: char,
+    token: &str,
+) {
+    writer.stdout(&format!("{prefix}{token}"));
+    if !token.ends_with('\n') {
+        writer.stdout("\n\\ No newline at end of file\n");
     }
 }
 
