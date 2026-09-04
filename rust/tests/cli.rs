@@ -828,8 +828,10 @@ fn merge_bidirectional_convergence() {
     sb.run_in(&left, &["commit", "left"]);
     sb.run_in(&right, &["commit", "right"]);
 
-    sb.run_in(&left, &["merge", right.to_str().unwrap()]);
-    sb.run_in(&right, &["merge", left.to_str().unwrap()]);
+    let out1 = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out1.exit_code, 0, "merge into left failed: {}", out1.stderr);
+    let out2 = sb.run_in(&right, &["merge", left.to_str().unwrap()]);
+    assert_eq!(out2.exit_code, 0, "merge into right failed: {}", out2.stderr);
 
     let left_notes = std::fs::read_to_string(left.join("notes.txt")).unwrap();
     let right_notes = std::fs::read_to_string(right.join("notes.txt")).unwrap();
@@ -847,10 +849,11 @@ fn merge_idempotent() {
     sb.run_in(&left, &["commit", "left"]);
     sb.run_in(&right, &["commit", "right"]);
 
-    sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    let out1 = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out1.exit_code, 0, "first merge failed: {}", out1.stderr);
 
     let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
-    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.exit_code, 0, "re-merge failed: {}", out.stderr);
     assert_eq!(out.stdout, "(alice@x->1,bob@x->1,seed@x->1)\n");
     assert_eq!(out.stderr, "");
 }
@@ -866,7 +869,7 @@ fn merge_equal_history_is_noop() {
     copy_dir_all(&left, &right);
 
     let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
-    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.exit_code, 0, "merge failed: {}", out.stderr);
     assert_eq!(out.stdout, "()\n");
     assert_eq!(out.stderr, "");
 }
@@ -928,7 +931,7 @@ fn merge_identical_concurrent_changes_no_warning() {
     sb.run_in(&right, &["commit", "identical"]);
 
     let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
-    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.exit_code, 0, "merge failed: {}", out.stderr);
     assert_eq!(out.stderr, "");
 
     let content = std::fs::read_to_string(left.join("notes.txt")).unwrap();
