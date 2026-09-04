@@ -233,7 +233,6 @@ impl FromStr for Version {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let err = || ParseError::InvalidVersion(s.to_owned());
 
-        let s = s.trim_start().trim_end();
         if s.contains(char::is_whitespace) {
             return Err(err());
         }
@@ -374,6 +373,8 @@ mod tests {
     fn rejects_whitespace() {
         assert!("(a@x->1, b@x->2)".parse::<Version>().is_err());
         assert!("( a@x->1)".parse::<Version>().is_err());
+        assert!(" (a@x->1)".parse::<Version>().is_err());
+        assert!("(a@x->1) ".parse::<Version>().is_err());
     }
 
     #[test]
