@@ -14,5 +14,3 @@ Cargo.lock
 .direnv/
 result
 
-# Scratch / local issues
-.scratch/
