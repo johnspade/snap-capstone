@@ -47,7 +47,8 @@ fn run<O: std::io::Write, E: std::io::Write>(
         ["revert", arg] if !arg.starts_with('-') => commands::revert(writer, arg),
         ["merge", arg] if !arg.starts_with('-') => commands::require_repo_stub("merge"),
         ["diff"] => commands::diff_working(writer),
-        ["diff", _, _] | ["diff", _, _, "--repo", _] => commands::require_repo_stub("diff"),
+        ["diff", old, new] => commands::diff_versions(writer, old, new),
+        ["diff", old, new, "--repo", repo] => commands::diff_cross_repo(writer, old, new, repo),
         ["diff", ..] => Err(SnapError::Expected(
             "usage: snap diff [<old> <new> [--repo <repository>]]".to_owned(),
         )),
