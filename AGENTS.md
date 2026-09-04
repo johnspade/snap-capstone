@@ -47,6 +47,11 @@ npm run check
 npm test
 ```
 
+## Pull requests
+
+When creating a PR, follow the template in
+`.github/pull_request_template.md` (What / Why / Testing sections).
+
 ## Scope discipline
 
 Snap’s small surface is deliberate. Do not add branches, staging, checkout,
