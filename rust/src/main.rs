@@ -22,6 +22,7 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Debug)]
 enum SnapError {
     Expected(String),
     Internal(String),
@@ -40,16 +41,17 @@ fn run<O: std::io::Write, E: std::io::Write>(
         ["config", "contributor.id", id] if !id.starts_with('-') => {
             commands::config(writer, false, id)
         }
-        ["status"] => commands::require_repo("status"),
-        ["log"] => commands::require_repo("log"),
-        ["commit", _msg] => commands::require_repo("commit"),
-        ["revert", arg] if !arg.starts_with('-') => commands::require_repo("revert"),
-        ["merge", arg] if !arg.starts_with('-') => commands::require_repo("merge"),
-        ["diff"] | ["diff", _, _] | ["diff", _, _, "--repo", _] => commands::require_repo("diff"),
+        ["status"] => commands::status(writer),
+        ["log"] => commands::log(writer),
+        ["commit", msg] => commands::commit(writer, msg),
+        ["revert", arg] if !arg.starts_with('-') => commands::require_repo_stub("revert"),
+        ["merge", arg] if !arg.starts_with('-') => commands::require_repo_stub("merge"),
+        ["diff"] => commands::diff_working(writer),
+        ["diff", _, _] | ["diff", _, _, "--repo", _] => commands::require_repo_stub("diff"),
         ["diff", ..] => Err(SnapError::Expected(
             "usage: snap diff [<old> <new> [--repo <repository>]]".to_owned(),
         )),
-        ["--serve"] | ["--serve", _] => commands::require_repo("serve"),
+        ["--serve"] | ["--serve", _] => commands::require_repo_stub("serve"),
         _ => Err(invalid_command_or_args()),
     }
 }
