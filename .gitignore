@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+
+# Node / TypeScript
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust
+target/
+Cargo.lock
+
+# Scratch / local issues
+.scratch/
