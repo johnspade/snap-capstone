@@ -24,15 +24,17 @@ impl Sandbox {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        let output = Command::new(snap_bin())
-            .args(args)
+        let mut cmd = Command::new(snap_bin());
+        cmd.args(args)
             .current_dir(cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", self.dir.path().join("home"))
-            .env("NO_COLOR", "1")
-            .output()
-            .unwrap();
+            .env("NO_COLOR", "1");
+        if let Ok(val) = std::env::var("LLVM_PROFILE_FILE") {
+            cmd.env("LLVM_PROFILE_FILE", val);
+        }
+        let output = cmd.output().unwrap();
         Output {
             stdout: String::from_utf8(output.stdout).unwrap(),
             stderr: String::from_utf8(output.stderr).unwrap(),
@@ -411,4 +413,165 @@ fn config_from_subdirectory_finds_repo() {
     let config = std::fs::read_to_string(repo.join(".snap/config.json")).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&config).unwrap();
     assert_eq!(parsed["contributor"]["id"], "a@x");
+}
+
+// ── revert ────────────────────────────────────────────────────────
+
+fn setup_repo_with_commit(sb: &Sandbox) -> std::path::PathBuf {
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let out = sb.run_in(&repo, &["init"]);
+    assert_eq!(out.exit_code, 0, "init: {}", out.stderr);
+    let out = sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    assert_eq!(out.exit_code, 0, "config: {}", out.stderr);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+    let out = sb.run_in(&repo, &["commit", "first"]);
+    assert_eq!(out.exit_code, 0, "commit: {}", out.stderr);
+    assert_eq!(out.stdout, "(a@x->1)\n");
+    repo
+}
+
+#[test]
+fn revert_to_empty_version() {
+    let sb = Sandbox::new();
+    let repo = setup_repo_with_commit(&sb);
+
+    let out = sb.run_in(&repo, &["revert", "()"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "(a@x->2)\n");
+    assert_eq!(out.stderr, "");
+    assert!(!repo.join("f.txt").exists());
+}
+
+#[test]
+fn revert_restores_file_content() {
+    let sb = Sandbox::new();
+    let repo = setup_repo_with_commit(&sb);
+
+    std::fs::write(repo.join("f.txt"), "modified\n").unwrap();
+    let out = sb.run_in(&repo, &["commit", "modify"]);
+    assert_eq!(out.exit_code, 0);
+
+    let out = sb.run_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "(a@x->3)\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("f.txt")).unwrap(),
+        "hello\n"
+    );
+}
+
+#[test]
+fn revert_is_additive() {
+    let sb = Sandbox::new();
+    let repo = setup_repo_with_commit(&sb);
+
+    std::fs::write(repo.join("f.txt"), "v2\n").unwrap();
+    let out = sb.run_in(&repo, &["commit", "second"]);
+    assert_eq!(out.exit_code, 0);
+
+    let out = sb.run_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "(a@x->3)\n");
+
+    let out = sb.run_in(&repo, &["log"]);
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("revert to (a@x->1)"));
+    assert_eq!(out.stdout.lines().count(), 3);
+}
+
+#[test]
+fn revert_unknown_version_fails() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+
+    let out = sb.run_in(&repo, &["revert", "(unknown@x->1)"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("unknown version"));
+}
+
+#[test]
+fn revert_same_tree_fails() {
+    let sb = Sandbox::new();
+    let repo = setup_repo_with_commit(&sb);
+
+    let out = sb.run_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("target tree is already current"));
+}
+
+#[test]
+fn revert_dirty_tree_fails() {
+    let sb = Sandbox::new();
+    let repo = setup_repo_with_commit(&sb);
+
+    std::fs::write(repo.join("f.txt"), "modified\n").unwrap();
+    let out = sb.run_in(&repo, &["commit", "second"]);
+    assert_eq!(out.exit_code, 0);
+
+    std::fs::write(repo.join("dirty"), "dirty").unwrap();
+    let out = sb.run_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("working tree is dirty"));
+}
+
+#[test]
+fn revert_requires_contributor() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["revert", "()"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("contributor.id is required"));
+}
+
+#[test]
+fn revert_invalid_version_fails() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_in(&repo, &["revert", "not-a-version"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("invalid version"));
+}
+
+#[test]
+fn revert_file_to_directory_transition() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+
+    std::fs::write(repo.join("node"), "file\n").unwrap();
+    sb.run_in(&repo, &["commit", "file"]);
+
+    std::fs::remove_file(repo.join("node")).unwrap();
+    std::fs::create_dir(repo.join("node")).unwrap();
+    std::fs::write(repo.join("node/child"), "child\n").unwrap();
+    sb.run_in(&repo, &["commit", "directory"]);
+
+    let out = sb.run_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "(a@x->3)\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("node")).unwrap(),
+        "file\n"
+    );
+    assert!(!repo.join("node/child").exists());
+}
+
+#[test]
+fn revert_without_repo_fails() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["revert", "()"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("not a Snap repository"));
 }

@@ -5,7 +5,7 @@ use snap::filesystem::{self, Tree};
 use snap::replay;
 use snap::repository::{self, Change, Patch, Repository};
 use snap::text;
-use snap::version::ContributorId;
+use snap::version::{ContributorId, Version};
 use snap::writer::Writer;
 
 use super::SnapError;
@@ -212,6 +212,69 @@ pub fn commit<O: std::io::Write, E: std::io::Write>(
     Ok(())
 }
 
+pub fn revert<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    version_str: &str,
+) -> Result<(), SnapError> {
+    let repo_root = require_repo()?;
+    let target_version: Version = version_str
+        .parse()
+        .map_err(|_| SnapError::Expected(format!("invalid version: {version_str}")))?;
+    let repo = load_repo(&repo_root)?;
+
+    if !is_version_known(&repo, &target_version) {
+        return Err(SnapError::Expected(format!(
+            "unknown version: {version_str}"
+        )));
+    }
+
+    let target_result = replay::replay(&repo.patches, &target_version)
+        .map_err(|e| SnapError::Internal(e.to_string()))?;
+    let target_tree = target_result.tree;
+
+    let contributor = resolve_contributor(&repo_root)?;
+
+    let current_tree = replay_to_frontier(&repo)?;
+
+    let working_tree = filesystem::scan_working_tree(&repo_root)
+        .map_err(|e| SnapError::Expected(e.to_string()))?;
+    if !filesystem::is_clean(&working_tree, &current_tree) {
+        return Err(SnapError::Expected("working tree is dirty".to_owned()));
+    }
+
+    if current_tree == target_tree {
+        return Err(SnapError::Expected(
+            "target tree is already current".to_owned(),
+        ));
+    }
+
+    let changes = build_changes(&current_tree, &target_tree)?;
+
+    let message = format!("revert to {target_version}");
+    let revision = repo.frontier.get(&contributor) + 1;
+
+    let patch = Patch {
+        author: contributor,
+        revision,
+        base: repo.frontier.clone(),
+        message,
+        changes,
+    };
+
+    let new_version = patch.result_version();
+
+    let mut new_repo = repo;
+    new_repo.frontier = new_version.clone();
+    new_repo.patches.push(patch);
+
+    filesystem::materialize(&repo_root, &target_tree)
+        .map_err(|e| SnapError::Internal(e.to_string()))?;
+    atomic_write_repo(&repo_root, &new_repo)?;
+
+    writer.stdout(&format!("{new_version}\n"));
+    Ok(())
+}
+
 pub fn require_repo_stub(_cmd: &str) -> Result<(), SnapError> {
     require_repo()?;
     Err(SnapError::Expected("not implemented".to_owned()))
@@ -368,6 +431,21 @@ fn escape_log_message(message: &str) -> String {
         .replace('\\', "\\\\")
         .replace('\t', "\\t")
         .replace('\n', "\\n")
+}
+
+fn is_version_known(repo: &Repository, version: &Version) -> bool {
+    for (contributor, target_rev) in version.components() {
+        for rev in 1..=*target_rev {
+            let exists = repo
+                .patches
+                .iter()
+                .any(|p| p.author == *contributor && p.revision == rev);
+            if !exists {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn atomic_write_repo(repo_root: &Path, repo: &Repository) -> Result<(), SnapError> {
@@ -704,5 +782,69 @@ mod tests {
             output,
             "--- /dev/null\n+++ b/f.txt\n@@ -1,0 +1,1 @@\n+no newline\n\\ No newline at end of file\n"
         );
+    }
+
+    // ── is_version_known ─────────────────────────────────────
+
+    fn make_patch(author: &str, revision: u64, base: Version) -> Patch {
+        let contributor = ContributorId::new(author).unwrap();
+        Patch {
+            author: contributor,
+            revision,
+            base,
+            message: format!("patch {revision}"),
+            changes: vec![Change::Text {
+                path: format!("f{revision}.txt"),
+                edit: text::EditScript::new(vec![]).unwrap(),
+            }],
+        }
+    }
+
+    #[test]
+    fn empty_version_always_known() {
+        let repo = Repository::empty();
+        assert!(is_version_known(&repo, &Version::empty()));
+    }
+
+    #[test]
+    fn known_single_contributor() {
+        let p1 = make_patch("a@x", 1, Version::empty());
+        let p2 = make_patch("a@x", 2, p1.result_version());
+        let repo = Repository {
+            frontier: p2.result_version(),
+            patches: vec![p1, p2],
+        };
+        let v: Version = "(a@x->2)".parse().unwrap();
+        assert!(is_version_known(&repo, &v));
+    }
+
+    #[test]
+    fn unknown_missing_contributor() {
+        let repo = Repository::empty();
+        let v: Version = "(a@x->1)".parse().unwrap();
+        assert!(!is_version_known(&repo, &v));
+    }
+
+    #[test]
+    fn unknown_missing_intermediate_revision() {
+        let p1 = make_patch("a@x", 1, Version::empty());
+        let repo = Repository {
+            frontier: p1.result_version(),
+            patches: vec![p1],
+        };
+        let v: Version = "(a@x->2)".parse().unwrap();
+        assert!(!is_version_known(&repo, &v));
+    }
+
+    #[test]
+    fn known_subset_of_frontier() {
+        let p1 = make_patch("a@x", 1, Version::empty());
+        let p2 = make_patch("a@x", 2, p1.result_version());
+        let repo = Repository {
+            frontier: p2.result_version(),
+            patches: vec![p1, p2],
+        };
+        let v: Version = "(a@x->1)".parse().unwrap();
+        assert!(is_version_known(&repo, &v));
     }
 }
