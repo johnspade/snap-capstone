@@ -594,7 +594,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod proptests {
     use super::*;
     use proptest::prelude::*;
