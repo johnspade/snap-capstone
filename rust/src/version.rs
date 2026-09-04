@@ -303,6 +303,13 @@ impl<'de> Deserialize<'de> for Version {
                 let mut components = Vec::new();
                 while let Some((id_str, rev)) = seq.next_element::<(String, u64)>()? {
                     let id = ContributorId::new(&id_str).map_err(de::Error::custom)?;
+                    if let Some((prev_id, _)) = components.last() {
+                        if &id <= prev_id {
+                            return Err(de::Error::custom(
+                                "version components are not in canonical order",
+                            ));
+                        }
+                    }
                     components.push((id, rev));
                 }
                 Version::new(components).map_err(de::Error::custom)
