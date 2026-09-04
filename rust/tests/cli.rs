@@ -831,7 +831,11 @@ fn merge_bidirectional_convergence() {
     let out1 = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
     assert_eq!(out1.exit_code, 0, "merge into left failed: {}", out1.stderr);
     let out2 = sb.run_in(&right, &["merge", left.to_str().unwrap()]);
-    assert_eq!(out2.exit_code, 0, "merge into right failed: {}", out2.stderr);
+    assert_eq!(
+        out2.exit_code, 0,
+        "merge into right failed: {}",
+        out2.stderr
+    );
 
     let left_notes = std::fs::read_to_string(left.join("notes.txt")).unwrap();
     let right_notes = std::fs::read_to_string(right.join("notes.txt")).unwrap();
