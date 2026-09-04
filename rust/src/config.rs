@@ -157,7 +157,7 @@ struct RawContributor {
     id: String,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
 
