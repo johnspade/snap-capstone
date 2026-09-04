@@ -214,6 +214,97 @@ fn coalesce_insert(ops: &mut Vec<EditOp>, token: &str) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TransformError {
+    #[error("unmatched {kind} remaining after transform")]
+    UnmatchedOps { kind: &'static str },
+}
+
+/// Transform incoming edit `P` so it applies after aggregate context edit `Q` (§6.3).
+///
+/// # Errors
+/// Returns an error if P and Q consume different base token counts or if
+/// unmatched retain/delete operations remain.
+pub fn transform(
+    incoming: &EditScript,
+    context: &EditScript,
+) -> Result<EditScript, TransformError> {
+    use std::collections::VecDeque;
+
+    let mut p: VecDeque<EditOp> = incoming.ops().iter().cloned().collect();
+    let mut q: VecDeque<EditOp> = context.ops().iter().cloned().collect();
+    let mut out: Vec<EditOp> = Vec::new();
+
+    loop {
+        match (p.front(), q.front()) {
+            (None, None) => break,
+
+            // Q insert: retain over it, consume Q only
+            (_, Some(EditOp::Insert(tokens))) => {
+                coalesce_retain(&mut out, tokens.len());
+                q.pop_front();
+            }
+
+            // P insert: keep it, consume P only
+            (Some(EditOp::Insert(tokens)), _) => {
+                for t in tokens.clone() {
+                    coalesce_insert(&mut out, &t);
+                }
+                p.pop_front();
+            }
+
+            // P retain, Q retain
+            (Some(EditOp::Retain(pn)), Some(EditOp::Retain(qn))) => {
+                let pn = *pn;
+                let qn = *qn;
+                let min = pn.min(qn);
+                coalesce_retain(&mut out, min);
+                split_or_consume(&mut p, pn, min);
+                split_or_consume(&mut q, qn, min);
+            }
+
+            // P delete, Q retain
+            (Some(EditOp::Delete(pn)), Some(EditOp::Retain(qn))) => {
+                let pn = *pn;
+                let qn = *qn;
+                let min = pn.min(qn);
+                coalesce_delete(&mut out, min);
+                split_or_consume(&mut p, pn, min);
+                split_or_consume(&mut q, qn, min);
+            }
+
+            // P retain/delete, Q delete: both consumed, no output
+            (Some(EditOp::Retain(pn) | EditOp::Delete(pn)), Some(EditOp::Delete(qn))) => {
+                let pn = *pn;
+                let qn = *qn;
+                let min = pn.min(qn);
+                split_or_consume(&mut p, pn, min);
+                split_or_consume(&mut q, qn, min);
+            }
+
+            // One side has retain/delete but other is exhausted → mismatch
+            (Some(_), None) | (None, Some(_)) => {
+                let kind = if p.front().is_some() { "P" } else { "Q" };
+                return Err(TransformError::UnmatchedOps { kind });
+            }
+        }
+    }
+
+    Ok(EditScript { ops: out })
+}
+
+fn split_or_consume(deque: &mut std::collections::VecDeque<EditOp>, count: usize, consumed: usize) {
+    let remaining = count - consumed;
+    if remaining == 0 {
+        deque.pop_front();
+    } else {
+        match deque.front_mut() {
+            Some(EditOp::Retain(n) | EditOp::Delete(n)) => *n = remaining,
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +724,235 @@ mod tests {
                 "b\n".to_owned(),
                 "a\n".to_owned()
             ])]
+        );
+    }
+
+    // --- transform ---
+
+    fn script(ops: Vec<EditOp>) -> EditScript {
+        EditScript::new(ops).unwrap()
+    }
+
+    #[track_caller]
+    fn assert_transform_merge(base_text: &str, p_text: &str, q_text: &str, expected_text: &str) {
+        let base = tokenize(base_text);
+        let p = diff(&base, &tokenize(p_text));
+        let q = diff(&base, &tokenize(q_text));
+        let transformed = transform(&p, &q).unwrap();
+        let after_q = q.apply(&base).unwrap();
+        let after_q_refs: Vec<&str> = after_q.iter().map(String::as_str).collect();
+        let final_result = transformed.apply(&after_q_refs).unwrap();
+        let expected: Vec<String> = tokenize(expected_text)
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(final_result, expected);
+    }
+
+    #[test]
+    fn transform_both_empty() {
+        let result = transform(&script(vec![]), &script(vec![])).unwrap();
+        assert!(result.ops().is_empty());
+    }
+
+    #[test]
+    fn transform_q_insert_only() {
+        // Q inserts 2 tokens, P is empty → retain(2)
+        let p = script(vec![]);
+        let q = script(vec![EditOp::Insert(vec!["x\n".into(), "y\n".into()])]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Retain(2)]);
+    }
+
+    #[test]
+    fn transform_p_insert_only() {
+        // P inserts 2 tokens, Q is empty → same insert
+        let p = script(vec![EditOp::Insert(vec!["a\n".into(), "b\n".into()])]);
+        let q = script(vec![]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(
+            result.ops(),
+            &[EditOp::Insert(vec!["a\n".into(), "b\n".into()])]
+        );
+    }
+
+    #[test]
+    fn transform_retain_retain_equal() {
+        let p = script(vec![EditOp::Retain(3)]);
+        let q = script(vec![EditOp::Retain(3)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Retain(3)]);
+    }
+
+    #[test]
+    fn transform_retain_retain_split() {
+        // P: retain(5), Q: retain(3), delete(2)
+        // retain(3) vs retain(3) → retain(3)
+        // retain(2) vs delete(2) → nothing
+        let p = script(vec![EditOp::Retain(5)]);
+        let q = script(vec![EditOp::Retain(3), EditOp::Delete(2)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Retain(3)]);
+    }
+
+    #[test]
+    fn transform_delete_retain_equal() {
+        let p = script(vec![EditOp::Delete(3)]);
+        let q = script(vec![EditOp::Retain(3)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Delete(3)]);
+    }
+
+    #[test]
+    fn transform_delete_retain_split() {
+        // P: delete(2), retain(1). Q: retain(3).
+        // delete(2) vs retain(2) → delete(2), then retain(1) vs retain(1) → retain(1)
+        let p = script(vec![EditOp::Delete(2), EditOp::Retain(1)]);
+        let q = script(vec![EditOp::Retain(3)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Delete(2), EditOp::Retain(1)]);
+    }
+
+    #[test]
+    fn transform_retain_delete_equal() {
+        // P retains what Q deletes → nothing in output
+        let p = script(vec![EditOp::Retain(2)]);
+        let q = script(vec![EditOp::Delete(2)]);
+        let result = transform(&p, &q).unwrap();
+        assert!(result.ops().is_empty());
+    }
+
+    #[test]
+    fn transform_retain_delete_split() {
+        // P: retain(3). Q: delete(2), retain(1).
+        // retain(2) vs delete(2) → nothing
+        // retain(1) vs retain(1) → retain(1)
+        let p = script(vec![EditOp::Retain(3)]);
+        let q = script(vec![EditOp::Delete(2), EditOp::Retain(1)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Retain(1)]);
+    }
+
+    #[test]
+    fn transform_delete_delete_equal() {
+        // Both delete the same 2 base tokens → nothing
+        let p = script(vec![EditOp::Delete(2)]);
+        let q = script(vec![EditOp::Delete(2)]);
+        let result = transform(&p, &q).unwrap();
+        assert!(result.ops().is_empty());
+    }
+
+    #[test]
+    fn transform_delete_delete_split() {
+        // P: delete(3). Q: delete(2), retain(1).
+        // delete(2) vs delete(2) → nothing
+        // delete(1) vs retain(1) → delete(1)
+        let p = script(vec![EditOp::Delete(3)]);
+        let q = script(vec![EditOp::Delete(2), EditOp::Retain(1)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(result.ops(), &[EditOp::Delete(1)]);
+    }
+
+    #[test]
+    fn transform_trailing_inserts_both_sides() {
+        // P: retain(1), insert(["P\n"]). Q: retain(1), insert(["Q\n"]).
+        // Step 1: P retain(1) vs Q retain(1) → retain(1)
+        // Step 2: Q insert(["Q\n"]) → retain(1) (Q insert has priority), coalesced to retain(2)
+        // Step 3: P insert(["P\n"]) → insert(["P\n"])
+        let p = script(vec![EditOp::Retain(1), EditOp::Insert(vec!["P\n".into()])]);
+        let q = script(vec![EditOp::Retain(1), EditOp::Insert(vec!["Q\n".into()])]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(
+            result.ops(),
+            &[EditOp::Retain(2), EditOp::Insert(vec!["P\n".into()]),]
+        );
+    }
+
+    #[test]
+    fn transform_empty_p_nonempty_q() {
+        // P is empty (no base), Q operates on base of 2 tokens
+        // This is a base count mismatch → error
+        let p = script(vec![]);
+        let q = script(vec![EditOp::Retain(2)]);
+        let err = transform(&p, &q).unwrap_err();
+        assert!(matches!(err, TransformError::UnmatchedOps { .. }));
+    }
+
+    #[test]
+    fn transform_nonempty_p_empty_q() {
+        // P operates on 2 base tokens, Q is empty → error
+        let p = script(vec![EditOp::Retain(2)]);
+        let q = script(vec![]);
+        let err = transform(&p, &q).unwrap_err();
+        assert!(matches!(err, TransformError::UnmatchedOps { .. }));
+    }
+
+    #[test]
+    fn transform_p_creates_from_empty_q_inserts() {
+        // Both operate on empty base. P inserts, Q inserts.
+        // Q insert priority: retain over Q insert, then P insert.
+        let p = script(vec![EditOp::Insert(vec!["P\n".into()])]);
+        let q = script(vec![EditOp::Insert(vec!["Q\n".into()])]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(
+            result.ops(),
+            &[EditOp::Retain(1), EditOp::Insert(vec!["P\n".into()])]
+        );
+    }
+
+    #[test]
+    fn transform_concurrent_inserts_q_priority() {
+        // Both insert at position 0 with base size 1.
+        // Q insert has priority → retain over Q's, then P's insert, then retain base.
+        // P: insert(["P\n"]), retain(1). Q: insert(["Q\n"]), retain(1).
+        // Step 1: Q insert → retain(1) in output, consume Q only
+        // Step 2: P insert → insert(["P\n"]) in output, consume P only
+        // Step 3: P retain(1) vs Q retain(1) → retain(1)
+        let p = script(vec![EditOp::Insert(vec!["P\n".into()]), EditOp::Retain(1)]);
+        let q = script(vec![EditOp::Insert(vec!["Q\n".into()]), EditOp::Retain(1)]);
+        let result = transform(&p, &q).unwrap();
+        assert_eq!(
+            result.ops(),
+            &[
+                EditOp::Retain(1),
+                EditOp::Insert(vec!["P\n".into()]),
+                EditOp::Retain(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn transform_q_insert_before_p_delete_survives() {
+        assert_transform_merge(
+            "0\n1\n2\n3\n4\n",
+            "0\n2\n3\n4\n",
+            "0\nB\n1\n2\n3\n4\n",
+            "0\nB\n2\n3\n4\n",
+        );
+    }
+
+    #[test]
+    fn transform_retain_and_append_vs_delete() {
+        assert_transform_merge(
+            "0\n1\n2\n3\n4\n",
+            "0\n1\n2\n3\n4\nA\n",
+            "0\n2\n3\n4\n",
+            "0\n2\n3\n4\nA\n",
+        );
+    }
+
+    #[test]
+    fn transform_overlapping_deletes_from_yaml() {
+        assert_transform_merge("0\n1\n2\n3\n4\n", "0\n3\n4\n", "0\n2\n3\n4\n", "0\n3\n4\n");
+    }
+
+    #[test]
+    fn transform_complex_mixed_from_yaml() {
+        assert_transform_merge(
+            "0\n1\n2\n3\n4\n",
+            "A\n0\n3\n4\nTAIL\n",
+            "0\n1\nB\n3\n4\n",
+            "A\n0\nB\n3\n4\nTAIL\n",
         );
     }
 }
