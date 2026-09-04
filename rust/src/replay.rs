@@ -63,6 +63,28 @@ pub fn replay(patches: &[Patch], target: &Version) -> Result<ReplayResult, Repla
     })
 }
 
+/// Returns patch indices in canonical integration order for all patches.
+///
+/// # Errors
+/// Returns `ReplayError::CyclicOrMissingDependency` if the history has a cycle.
+///
+/// # Panics
+/// Panics if the internal ordering produces a patch not in the input slice
+/// (should never happen for a valid call).
+pub fn canonical_order(patches: &[Patch]) -> Result<Vec<usize>, ReplayError> {
+    let refs: Vec<&Patch> = patches.iter().collect();
+    let ordered = integration_order(&refs)?;
+    Ok(ordered
+        .iter()
+        .map(|p| {
+            patches
+                .iter()
+                .position(|orig| std::ptr::eq(orig, *p))
+                .expect("ordered patch came from the input slice")
+        })
+        .collect())
+}
+
 fn select_patches<'a>(patches: &'a [Patch], target: &Version) -> Vec<&'a Patch> {
     patches
         .iter()
