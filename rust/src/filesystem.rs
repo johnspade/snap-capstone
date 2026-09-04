@@ -359,8 +359,13 @@ mod tests {
     fn clean_both_empty() {
         assert!(is_clean(&Tree::new(), &Tree::new()));
     }
+}
 
-    // ── Scanning (temp dir tests) ───────────────────────────────────
+#[cfg(all(test, not(miri)))]
+mod io_tests {
+    use super::*;
+
+    // ── Scanning ────────────────────────────────────────────────────
 
     #[test]
     fn scan_empty_dir() {
@@ -440,7 +445,7 @@ mod tests {
         assert!(tree.is_empty());
     }
 
-    // ── Materialization (temp dir tests) ────────────────────────────
+    // ── Materialization ─────────────────────────────────────────────
 
     #[test]
     fn materialize_creates_files() {
