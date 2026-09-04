@@ -5,7 +5,7 @@ use snap::filesystem::{self, Tree};
 use snap::replay;
 use snap::repository::{self, Change, Patch, Repository};
 use snap::text;
-use snap::version::ContributorId;
+use snap::version::{ContributorId, Version};
 use snap::writer::Writer;
 
 use super::SnapError;
@@ -128,32 +128,51 @@ pub fn diff_working<O: std::io::Write, E: std::io::Write>(
     let working_tree = filesystem::scan_working_tree(&repo_root)
         .map_err(|e| SnapError::Expected(e.to_string()))?;
 
-    let mut paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for path in current_tree.keys() {
-        paths.insert(path);
-    }
-    for path in working_tree.keys() {
-        paths.insert(path);
-    }
+    format_tree_diff(writer, &current_tree, &working_tree);
+    Ok(())
+}
 
-    for path in paths {
-        let old = current_tree.get(path);
-        let new = working_tree.get(path);
+pub fn diff_versions<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    old_str: &str,
+    new_str: &str,
+) -> Result<(), SnapError> {
+    let repo_root = require_repo()?;
+    let repo = load_repo(&repo_root)?;
 
-        match (old, new) {
-            (None, Some(new_content)) => {
-                format_diff_addition(writer, path, new_content);
-            }
-            (Some(old_content), None) => {
-                format_diff_deletion(writer, path, old_content);
-            }
-            (Some(old_content), Some(new_content)) if old_content != new_content => {
-                format_diff_modification(writer, path, old_content, new_content);
-            }
-            _ => {}
-        }
-    }
+    let old_version = parse_version(old_str)?;
+    let new_version = parse_version(new_str)?;
+    validate_version_known(&old_version, &repo)?;
+    validate_version_known(&new_version, &repo)?;
 
+    let old_tree = replay_to_version(&repo, &old_version)?;
+    let new_tree = replay_to_version(&repo, &new_version)?;
+
+    format_tree_diff(writer, &old_tree, &new_tree);
+    Ok(())
+}
+
+pub fn diff_cross_repo<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    old_str: &str,
+    new_str: &str,
+    repo_path: &str,
+) -> Result<(), SnapError> {
+    let repo_root = require_repo()?;
+    let local_repo = load_repo(&repo_root)?;
+
+    let old_version = parse_version(old_str)?;
+    let new_version = parse_version(new_str)?;
+    validate_version_known(&old_version, &local_repo)?;
+
+    let remote_repo = load_repo_from_path(repo_path)?;
+    validate_version_known(&new_version, &remote_repo)?;
+    validate_shared_dots(&local_repo, &remote_repo)?;
+
+    let old_tree = replay_to_version(&local_repo, &old_version)?;
+    let new_tree = replay_to_version(&remote_repo, &new_version)?;
+
+    format_tree_diff(writer, &old_tree, &new_tree);
     Ok(())
 }
 
@@ -251,6 +270,57 @@ fn replay_to_frontier(repo: &Repository) -> Result<Tree, SnapError> {
     let result = replay::replay(&repo.patches, &repo.frontier)
         .map_err(|e| SnapError::Internal(e.to_string()))?;
     Ok(result.tree)
+}
+
+fn replay_to_version(repo: &Repository, version: &Version) -> Result<Tree, SnapError> {
+    let result =
+        replay::replay(&repo.patches, version).map_err(|e| SnapError::Internal(e.to_string()))?;
+    Ok(result.tree)
+}
+
+fn parse_version(s: &str) -> Result<Version, SnapError> {
+    s.parse::<Version>()
+        .map_err(|_| SnapError::Expected(format!("invalid version: {s}")))
+}
+
+fn validate_version_known(version: &Version, repo: &Repository) -> Result<(), SnapError> {
+    for (id, rev) in version.components() {
+        for r in 1..=*rev {
+            if !repo
+                .patches
+                .iter()
+                .any(|p| p.author == *id && p.revision == r)
+            {
+                return Err(SnapError::Expected(format!("unknown version: {version}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_repo_from_path(path: &str) -> Result<Repository, SnapError> {
+    let repo_root = PathBuf::from(path);
+    if !repo_root.join(".snap").is_dir() {
+        return Err(SnapError::Expected(format!(
+            "not a Snap repository: {path}"
+        )));
+    }
+    load_repo(&repo_root)
+}
+
+fn validate_shared_dots(local: &Repository, remote: &Repository) -> Result<(), SnapError> {
+    for lp in &local.patches {
+        for rp in &remote.patches {
+            if lp.author == rp.author && lp.revision == rp.revision && lp != rp {
+                return Err(SnapError::Expected(format!(
+                    "patch collision: {} revision {}",
+                    lp.author.as_str(),
+                    lp.revision
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_contributor(repo_root: &Path) -> Result<ContributorId, SnapError> {
@@ -383,6 +453,38 @@ fn atomic_write_repo(repo_root: &Path, repo: &Repository) -> Result<(), SnapErro
 }
 
 // ── Diff formatting ────────────────────────────────────────────────
+
+fn format_tree_diff<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    old_tree: &Tree,
+    new_tree: &Tree,
+) {
+    let mut paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for path in old_tree.keys() {
+        paths.insert(path);
+    }
+    for path in new_tree.keys() {
+        paths.insert(path);
+    }
+
+    for path in paths {
+        let old = old_tree.get(path);
+        let new = new_tree.get(path);
+
+        match (old, new) {
+            (None, Some(new_content)) => {
+                format_diff_addition(writer, path, new_content);
+            }
+            (Some(old_content), None) => {
+                format_diff_deletion(writer, path, old_content);
+            }
+            (Some(old_content), Some(new_content)) if old_content != new_content => {
+                format_diff_modification(writer, path, old_content, new_content);
+            }
+            _ => {}
+        }
+    }
+}
 
 fn format_diff_addition<O: std::io::Write, E: std::io::Write>(
     writer: &mut Writer<O, E>,
@@ -704,5 +806,220 @@ mod tests {
             output,
             "--- /dev/null\n+++ b/f.txt\n@@ -1,0 +1,1 @@\n+no newline\n\\ No newline at end of file\n"
         );
+    }
+
+    // ── format_tree_diff ─────────────────────────────────────
+
+    #[test]
+    fn tree_diff_identical_trees_no_output() {
+        let mut out = Vec::new();
+        let err = Vec::new();
+        let mut w = Writer::new(&mut out, err);
+        let tree = tree_from(&[("a.txt", b"hello\n")]);
+        format_tree_diff(&mut w, &tree, &tree);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn tree_diff_addition_deletion_modification() {
+        let mut out = Vec::new();
+        let err = Vec::new();
+        let mut w = Writer::new(&mut out, err);
+        let old_tree = tree_from(&[("b.txt", b"old\n"), ("c.txt", b"keep\n")]);
+        let new_tree = tree_from(&[("a.txt", b"new\n"), ("b.txt", b"changed\n")]);
+        format_tree_diff(&mut w, &old_tree, &new_tree);
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("--- /dev/null\n+++ b/a.txt\n"));
+        assert!(output.contains("--- a/b.txt\n+++ b/b.txt\n"));
+        assert!(output.contains("--- a/c.txt\n+++ /dev/null\n"));
+    }
+
+    #[test]
+    fn tree_diff_paths_sorted() {
+        let mut out = Vec::new();
+        let err = Vec::new();
+        let mut w = Writer::new(&mut out, err);
+        let old = tree_from(&[]);
+        let new = tree_from(&[("z.txt", b"z\n"), ("a.txt", b"a\n")]);
+        format_tree_diff(&mut w, &old, &new);
+        let output = String::from_utf8(out).unwrap();
+        let a_pos = output.find("+++ b/a.txt").unwrap();
+        let z_pos = output.find("+++ b/z.txt").unwrap();
+        assert!(a_pos < z_pos);
+    }
+
+    #[test]
+    fn tree_diff_binary_files() {
+        let mut out = Vec::new();
+        let err = Vec::new();
+        let mut w = Writer::new(&mut out, err);
+        let old = tree_from(&[("f.bin", &[0x00, 0x01])]);
+        let new = tree_from(&[("f.bin", &[0xFF, 0xFE])]);
+        format_tree_diff(&mut w, &old, &new);
+        let output = String::from_utf8(out).unwrap();
+        assert_eq!(output, "Binary files a/f.bin and b/f.bin differ\n");
+    }
+
+    #[test]
+    fn tree_diff_empty_to_empty() {
+        let mut out = Vec::new();
+        let err = Vec::new();
+        let mut w = Writer::new(&mut out, err);
+        format_tree_diff(&mut w, &tree_from(&[]), &tree_from(&[]));
+        assert!(out.is_empty());
+    }
+
+    // ── validate_version_known ───────────────────────────────
+
+    #[test]
+    fn validate_empty_version_always_known() {
+        let repo = Repository::empty();
+        assert!(validate_version_known(&Version::empty(), &repo).is_ok());
+    }
+
+    #[test]
+    fn validate_version_known_with_matching_patches() {
+        use snap::text::EditScript;
+        let repo = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "first".to_owned(),
+                changes: vec![Change::Text {
+                    path: "f".to_owned(),
+                    edit: EditScript::new(vec![]).unwrap(),
+                }],
+            }],
+        };
+        assert!(validate_version_known(&"(a@x->1)".parse().unwrap(), &repo).is_ok());
+    }
+
+    #[test]
+    fn validate_version_unknown_missing_patch() {
+        let repo = Repository::empty();
+        let version: Version = "(a@x->1)".parse().unwrap();
+        let err = validate_version_known(&version, &repo).unwrap_err();
+        match err {
+            SnapError::Expected(msg) => assert!(msg.contains("unknown version")),
+            SnapError::Internal(_) => panic!("expected Expected error"),
+        }
+    }
+
+    #[test]
+    fn validate_version_unknown_gap_in_revisions() {
+        use snap::text::EditScript;
+        let repo = Repository {
+            frontier: "(a@x->2)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 2,
+                base: "(a@x->1)".parse().unwrap(),
+                message: "second".to_owned(),
+                changes: vec![Change::Text {
+                    path: "f".to_owned(),
+                    edit: EditScript::new(vec![]).unwrap(),
+                }],
+            }],
+        };
+        let version: Version = "(a@x->2)".parse().unwrap();
+        assert!(validate_version_known(&version, &repo).is_err());
+    }
+
+    // ── validate_shared_dots ─────────────────────────────────
+
+    #[test]
+    fn shared_dots_identical_patches_ok() {
+        use snap::text::{EditOp, EditScript};
+        let patch = Patch {
+            author: ContributorId::new("a@x").unwrap(),
+            revision: 1,
+            base: Version::empty(),
+            message: "same".to_owned(),
+            changes: vec![Change::Text {
+                path: "f".to_owned(),
+                edit: EditScript::new(vec![EditOp::Insert(vec!["hi\n".to_owned()])]).unwrap(),
+            }],
+        };
+        let local = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![patch.clone()],
+        };
+        let remote = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![patch],
+        };
+        assert!(validate_shared_dots(&local, &remote).is_ok());
+    }
+
+    #[test]
+    fn shared_dots_different_patches_fail() {
+        use snap::text::{EditOp, EditScript};
+        let local = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "local".to_owned(),
+                changes: vec![Change::Text {
+                    path: "f".to_owned(),
+                    edit: EditScript::new(vec![EditOp::Insert(vec!["local\n".to_owned()])])
+                        .unwrap(),
+                }],
+            }],
+        };
+        let remote = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "remote".to_owned(),
+                changes: vec![Change::Text {
+                    path: "f".to_owned(),
+                    edit: EditScript::new(vec![EditOp::Insert(vec!["remote\n".to_owned()])])
+                        .unwrap(),
+                }],
+            }],
+        };
+        let err = validate_shared_dots(&local, &remote).unwrap_err();
+        match err {
+            SnapError::Expected(msg) => assert!(msg.contains("patch collision")),
+            SnapError::Internal(_) => panic!("expected Expected error"),
+        }
+    }
+
+    #[test]
+    fn shared_dots_disjoint_patches_ok() {
+        use snap::text::EditScript;
+        let local = Repository {
+            frontier: "(a@x->1)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "local".to_owned(),
+                changes: vec![Change::Text {
+                    path: "f".to_owned(),
+                    edit: EditScript::new(vec![]).unwrap(),
+                }],
+            }],
+        };
+        let remote = Repository {
+            frontier: "(b@y->1)".parse().unwrap(),
+            patches: vec![Patch {
+                author: ContributorId::new("b@y").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "remote".to_owned(),
+                changes: vec![Change::Text {
+                    path: "g".to_owned(),
+                    edit: EditScript::new(vec![]).unwrap(),
+                }],
+            }],
+        };
+        assert!(validate_shared_dots(&local, &remote).is_ok());
     }
 }
