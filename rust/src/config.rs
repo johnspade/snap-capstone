@@ -11,8 +11,6 @@ pub enum ConfigError {
     InvalidJson(String),
     #[error("duplicate JSON key: {0}")]
     DuplicateKey(String),
-    #[error("unknown field in configuration file")]
-    UnknownField,
     #[error("invalid contributor id: {0}")]
     InvalidContributorId(String),
     #[error(transparent)]
@@ -48,10 +46,7 @@ pub fn read_config_file(path: &Path) -> Result<Option<ContributorId>, ConfigErro
 /// # Errors
 /// Returns `ConfigError::Io` on I/O failure.
 pub fn write_config_file(path: &Path, id: &ContributorId) -> Result<(), ConfigError> {
-    let json = format!(
-        "{{\n  \"contributor\": {{\n    \"id\": \"{}\"\n  }}\n}}\n",
-        id.as_str()
-    );
+    let json = format!("{{\"contributor\":{{\"id\":\"{}\"}}}}\n", id.as_str());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
