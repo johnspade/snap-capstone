@@ -17,24 +17,18 @@ jobs:
     name: "Nightly: baseline"
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
-    defaults:
-      run:
-        working-directory: rust
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - name: Run baseline
-        run: nix develop --command cargo test
+        run: nix develop --command bash -c 'cd rust && cargo test'
 
   mutants-full:
     name: "Nightly: shard ${{ matrix.shard }}"
     runs-on: ubuntu-latest
     needs: [mutants-baseline]
     if: github.event_name == 'schedule'
-    defaults:
-      run:
-        working-directory: rust
     strategy:
       fail-fast: false
       matrix:
@@ -44,7 +38,7 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - name: Run cargo-mutants (shard ${{ matrix.shard }}/8)
-        run: nix develop --command cargo mutants --in-place --no-shuffle -vV --timeout 300 --baseline=skip --shard ${{ matrix.shard }}/8
+        run: nix develop --command bash -c 'cd rust && cargo mutants --in-place --no-shuffle -vV --timeout 300 --baseline=skip --shard ${{ matrix.shard }}/8'
       - name: Upload mutants.out
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
@@ -57,9 +51,6 @@ jobs:
     name: Mutation testing (PR diff)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
-    defaults:
-      run:
-        working-directory: rust
     permissions:
       contents: read
       statuses: write
@@ -70,11 +61,11 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
       - name: Generate PR diff
-        run: git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+        run: git diff origin/${{ github.base_ref }}...HEAD -- rust/ > pr.diff
       - name: Run cargo-mutants on diff
         id: mutants
         run: |
-          nix develop --command cargo mutants --in-diff pr.diff --in-place -vV --timeout 300 || true
+          nix develop --command bash -c 'cd rust && cargo mutants --in-diff ../pr.diff --in-place -vV --timeout 300' || true
       - name: Upload mutants.out
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()

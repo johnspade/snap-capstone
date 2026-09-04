@@ -1,5 +1,5 @@
 {
-  description = "Snap - Rust development environment";
+  description = "Snap - development environment";
 
   inputs = {
     nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1.*.tar.gz";
@@ -31,13 +31,13 @@
     in
     {
       overlays.default = final: prev: {
-        rustToolchain = final.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain = final.rust-bin.fromRustupToolchainFile ./rust/rust-toolchain.toml;
       };
 
       packages = forEachSupportedSystem ({ pkgs, ... }:
         let
           craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rustToolchain;
-          src = craneLib.cleanCargoSource ./.;
+          src = craneLib.cleanCargoSource ./rust;
           commonArgs = { inherit src; };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
           bin = craneLib.buildPackage (commonArgs // {
@@ -51,7 +51,7 @@
       checks = forEachSupportedSystem ({ pkgs, ... }:
         let
           craneLib = (crane.mkLib pkgs).overrideToolchain pkgs.rustToolchain;
-          src = craneLib.cleanCargoSource ./.;
+          src = craneLib.cleanCargoSource ./rust;
           commonArgs = { inherit src; };
           cargoArtifacts = craneLib.buildDepsOnly commonArgs;
         in
@@ -106,6 +106,7 @@
           program = toString (pkgs.writeShellScript "miri" ''
             set -euo pipefail
             export PATH="${nightlyToolchain}/bin:$PATH"
+            cd rust
             cargo miri test
           '');
         };
@@ -127,20 +128,33 @@
 
       devShells = forEachSupportedSystem ({ pkgs, ... }:
         let
+          acceptance = pkgs.writeShellScriptBin "acceptance" ''
+            set -euo pipefail
+            cd "$(git rev-parse --show-toplevel)"
+            bin="$(nix build .#default --no-link --print-out-paths)/bin/snap"
+            cd test-harness
+            npm install --silent 2>&1
+            npx tsx src/cli.ts --candidate "$bin"
+          '';
           validate = pkgs.writeShellScriptBin "validate" ''
             set -euo pipefail
+            cd "$(git rev-parse --show-toplevel)"
             echo "==> Running Nix flake checks..."
             nix flake check --keep-going
             echo "==> Running Miri..."
             nix run .#miri
+            echo "==> Running acceptance tests..."
+            acceptance
             echo "==> All validations passed!"
           '';
           validate-all = pkgs.writeShellScriptBin "validate-all" ''
             set -euo pipefail
+            cd "$(git rev-parse --show-toplevel)"
             validate
             echo "==> Running mutation testing (diff vs main)..."
             git diff origin/main...HEAD > /tmp/mutants-diff.patch
             if [ -s /tmp/mutants-diff.patch ]; then
+              cd rust
               cargo mutants --in-diff /tmp/mutants-diff.patch --in-place -vV --timeout 300
             else
               echo "    No diff vs main, skipping"
@@ -149,8 +163,10 @@
           '';
           cargo-mutants-diff = pkgs.writeShellScriptBin "cargo-mutants-diff" ''
             set -euo pipefail
+            cd "$(git rev-parse --show-toplevel)"
             git diff origin/main...HEAD > /tmp/mutants-diff.patch
             if [ -s /tmp/mutants-diff.patch ]; then
+              cd rust
               cargo mutants --in-diff /tmp/mutants-diff.patch --in-place -vV --timeout 300
             else
               echo "No diff vs main, nothing to test"
@@ -168,6 +184,8 @@
             cargo-nextest
             cargo-watch
             rust-analyzer
+            nodejs
+            acceptance
             validate
             validate-all
             cargo-mutants-diff

@@ -12,6 +12,7 @@ Cargo.lock
 
 # Nix / direnv
 .direnv/
+result
 
 # Scratch / local issues
 .scratch/

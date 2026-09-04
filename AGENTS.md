@@ -25,19 +25,24 @@ their meaning.
 
 ## Verification
 
-After implementation changes, run the shared acceptance suite:
+After implementation changes, run the shared acceptance suite from the
+devShell:
 
 ```bash
-./capstones/snap/verify --lang ts
+acceptance
 ```
 
-Replace `ts` with `rust` or `scala` when appropriate.
+Or directly via the test harness:
 
+```bash
+cd test-harness
+npm run run -- --candidate ../result/bin/snap
+```
 
 After harness changes, also run:
 
 ```bash
-cd capstones/snap/test-harness
+cd test-harness
 npm run check
 npm test
 ```

@@ -2,16 +2,16 @@
 
 ## Development environment
 
-The Rust toolchain is managed by a Nix flake. `cd rust/` and let direnv
-activate the devShell (or run `nix develop` manually). All cargo subcommands,
-linters, and validation scripts are available inside the shell — do not
-install toolchains globally.
+The Rust toolchain is managed by the Nix flake at the repo root. `cd rust/`
+and let direnv activate the devShell (or run `nix develop` from the repo
+root). All cargo subcommands, linters, and validation scripts are available
+inside the shell — do not install toolchains globally.
 
 ## Verification
 
 Run `validate` inside the devShell before committing. It runs `nix flake
-check --keep-going` (fmt, clippy, test, deny, audit, doc, coverage) and
-Miri. CI runs the same checks.
+check --keep-going` (fmt, clippy, test, deny, audit, doc, coverage,
+acceptance tests) and Miri. CI runs the same checks.
 
 For a full validation including mutation testing: `validate-all`.
 
@@ -26,6 +26,7 @@ Individual checks from the devShell:
 | Advisory audit | `cargo audit` |
 | Docs | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` |
 | Coverage | `cargo llvm-cov --workspace --all-features` |
+| Acceptance | `acceptance` |
 | Miri | `nix run .#miri` |
 | Mutation (diff) | `cargo-mutants-diff` |
 
@@ -45,6 +46,11 @@ real problems.
 For genuine false positives, use `#[expect(..., reason = "...")]` instead
 of `#[allow]` so the suppression self-documents and warns if it becomes
 unnecessary.
+
+## Pushing to remote
+
+Run `validate` (or `validate-all`) and confirm all checks pass before
+pushing to the remote. Never push with failing checks.
 
 ## Commit messages
 
