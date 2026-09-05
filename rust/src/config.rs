@@ -9,7 +9,7 @@ use crate::version::ContributorId;
 pub enum ConfigError {
     #[error("invalid JSON in configuration file")]
     InvalidJson(String),
-    #[error("duplicate JSON key: {0}")]
+    #[error("duplicate JSON key {0}")]
     DuplicateKey(String),
     #[error("invalid contributor id: {0}")]
     InvalidContributorId(String),
