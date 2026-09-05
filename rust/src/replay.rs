@@ -1327,6 +1327,68 @@ mod proptests {
     use crate::version::ContributorId;
     use proptest::prelude::*;
 
+    fn make_patch(
+        author: &str,
+        revision: u64,
+        base: &str,
+        message: &str,
+        changes: Vec<Change>,
+    ) -> Patch {
+        Patch {
+            author: ContributorId::new(author).unwrap(),
+            revision,
+            base: base.parse().unwrap(),
+            message: message.to_owned(),
+            changes,
+        }
+    }
+
+    fn assert_three_way_convergence(
+        patches: &[Patch; 3],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let target = patches[0]
+            .result_version()
+            .join(&patches[1].result_version())
+            .join(&patches[2].result_version());
+
+        let perms: [(usize, usize, usize); 6] = [
+            (0, 1, 2),
+            (0, 2, 1),
+            (1, 0, 2),
+            (1, 2, 0),
+            (2, 0, 1),
+            (2, 1, 0),
+        ];
+
+        let baseline = replay(
+            &[patches[0].clone(), patches[1].clone(), patches[2].clone()],
+            &target,
+        )
+        .unwrap();
+
+        for (i, (x, y, z)) in perms.iter().enumerate().skip(1) {
+            let input = vec![
+                patches[*x].clone(),
+                patches[*y].clone(),
+                patches[*z].clone(),
+            ];
+            let result = replay(&input, &target).unwrap();
+            prop_assert_eq!(
+                &baseline.tree,
+                &result.tree,
+                "permutation {}: tree must match baseline",
+                i
+            );
+            prop_assert_eq!(
+                &baseline.warnings,
+                &result.warnings,
+                "permutation {}: warnings must match baseline",
+                i
+            );
+        }
+        Ok(())
+    }
+
     fn arb_contributor_id() -> impl Strategy<Value = ContributorId> {
         prop::sample::select(vec!["a@x", "b@y", "c@z"]).prop_map(|s| ContributorId::new(s).unwrap())
     }
@@ -1498,6 +1560,113 @@ mod proptests {
             for w in warns.windows(2) {
                 prop_assert!(w[0] <= w[1], "warnings not sorted: {:?} > {:?}", w[0], w[1]);
             }
+        }
+
+        #[test]
+        fn namespace_conflict_incoming_wins(
+            file_suffix in prop::sample::select(vec!["a", "b", "c"]),
+        ) {
+            let nested_path = format!("d/{file_suffix}");
+            let desc_patch = make_patch(
+                "b@y", 1, "()", "descendant",
+                vec![Change::Put { path: nested_path.clone(), content: b"nested\n".to_vec() }],
+            );
+            let file_patch = make_patch(
+                "a@x", 1, "()", "file",
+                vec![Change::Put { path: "d".to_owned(), content: b"file\n".to_vec() }],
+            );
+
+            let target = desc_patch.result_version().join(&file_patch.result_version());
+
+            let r1 = replay(&[desc_patch.clone(), file_patch.clone()], &target).unwrap();
+            let r2 = replay(&[file_patch, desc_patch], &target).unwrap();
+
+            prop_assert_eq!(&r1.tree, &r2.tree, "namespace conflict must be input-order independent");
+            prop_assert_eq!(&r1.warnings, &r2.warnings, "warnings must be input-order independent");
+            prop_assert!(
+                r1.warnings.iter().any(|(_, reason)| reason == "namespace-wins"),
+                "namespace-wins warning must be emitted"
+            );
+            // Verify exactly one of the two paths survives (the later-integrating one wins)
+            let has_file = r1.tree.contains_key("d");
+            let has_nested = r1.tree.contains_key(&nested_path);
+            prop_assert!(
+                has_file ^ has_nested,
+                "exactly one of file or nested must survive, got file={} nested={}", has_file, has_nested
+            );
+        }
+
+        #[test]
+        fn namespace_conflict_duplicate_warnings_collapse(
+            suffix_a in prop::sample::select(vec!["x", "y"]),
+            suffix_b in prop::sample::select(vec!["m", "n"]),
+        ) {
+            // Two incoming paths under "d/" conflict with file "d". Both removals of "d"
+            // should collapse into a single namespace-wins warning.
+            let p1 = make_patch(
+                "a@x", 1, "()", "dir",
+                vec![
+                    Change::Put { path: format!("d/{suffix_a}"), content: b"a\n".to_vec() },
+                    Change::Put { path: format!("d/{suffix_b}"), content: b"b\n".to_vec() },
+                ],
+            );
+            let p2 = make_patch(
+                "b@y", 1, "()", "file",
+                vec![Change::Put { path: "d".to_owned(), content: b"file\n".to_vec() }],
+            );
+
+            let target = p1.result_version().join(&p2.result_version());
+            let result = replay(&[p1, p2], &target).unwrap();
+
+            let ns_warnings: Vec<_> = result.warnings.iter()
+                .filter(|w| w.1 == "namespace-wins")
+                .collect();
+            // "d" can only appear once in the warning set (BTreeSet deduplicates)
+            let d_count = ns_warnings.iter().filter(|w| w.0 == "d").count();
+            prop_assert!(d_count <= 1, "duplicate 'd' warning not collapsed: {:?}", ns_warnings);
+        }
+
+        #[test]
+        fn three_way_convergence_disjoint(
+            a_content in "[a-z]{1,8}\n",
+            b_content in "[a-z]{1,8}\n",
+            c_content in "[a-z]{1,8}\n",
+        ) {
+            let patches = [
+                make_patch("a@x", 1, "()", "a", vec![Change::Put { path: "a".to_owned(), content: a_content.into_bytes() }]),
+                make_patch("b@y", 1, "()", "b", vec![Change::Put { path: "b".to_owned(), content: b_content.into_bytes() }]),
+                make_patch("c@z", 1, "()", "c", vec![Change::Put { path: "c".to_owned(), content: c_content.into_bytes() }]),
+            ];
+            assert_three_way_convergence(&patches)?;
+        }
+
+        #[test]
+        fn three_way_convergence_same_file(
+            a_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+            b_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+            c_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+        ) {
+            prop_assume!(a_content != b_content || b_content != c_content);
+            let patches = [
+                make_patch("a@x", 1, "()", "a", vec![Change::Put { path: "f".to_owned(), content: a_content }]),
+                make_patch("b@y", 1, "()", "b", vec![Change::Put { path: "f".to_owned(), content: b_content }]),
+                make_patch("c@z", 1, "()", "c", vec![Change::Put { path: "f".to_owned(), content: c_content }]),
+            ];
+            assert_three_way_convergence(&patches)?;
+        }
+
+        #[test]
+        fn three_way_convergence_with_namespace_conflict(
+            child in prop::sample::select(vec!["x", "y", "z"]),
+        ) {
+            // a creates file "n", b creates "n/<child>", c creates unrelated "q".
+            // All 6 input orderings must converge.
+            let patches = [
+                make_patch("a@x", 1, "()", "a", vec![Change::Put { path: "n".to_owned(), content: b"file\n".to_vec() }]),
+                make_patch("b@y", 1, "()", "b", vec![Change::Put { path: format!("n/{child}"), content: b"nested\n".to_vec() }]),
+                make_patch("c@z", 1, "()", "c", vec![Change::Put { path: "q".to_owned(), content: b"other\n".to_vec() }]),
+            ];
+            assert_three_way_convergence(&patches)?;
         }
     }
 }

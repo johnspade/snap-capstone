@@ -1223,6 +1223,322 @@ fn merge_dot_collision_fails_before_mutation() {
     );
 }
 
+// ── merge: namespace conflicts (§6.2) ─────────────────────────
+
+#[test]
+fn merge_namespace_file_replaces_directory() {
+    // alice creates file "a", bob creates "a/b" (needs "a" as directory).
+    // The incoming patch (alice's) wins — "a" stays as a file, "a/b" removed.
+    let sb = Sandbox::new();
+    let ancestor = sb.path().join("ancestor");
+    let descendant = sb.path().join("descendant");
+    std::fs::create_dir(&ancestor).unwrap();
+    std::fs::create_dir(&descendant).unwrap();
+
+    sb.run_in(&ancestor, &["init"]);
+    sb.run_in(&descendant, &["init"]);
+    sb.run_in(&ancestor, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&descendant, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(ancestor.join("a"), "ancestor\n").unwrap();
+    std::fs::create_dir(descendant.join("a")).unwrap();
+    std::fs::write(descendant.join("a/b"), "descendant\n").unwrap();
+
+    sb.run_in(&ancestor, &["commit", "ancestor"]);
+    sb.run_in(&descendant, &["commit", "descendant"]);
+
+    let out = sb.run_in(&ancestor, &["merge", descendant.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stderr, "warning: auto-resolved a/b: namespace-wins\n");
+
+    let content = std::fs::read_to_string(ancestor.join("a")).unwrap();
+    assert_eq!(content, "ancestor\n");
+    assert!(!ancestor.join("a/b").exists());
+}
+
+#[test]
+fn merge_namespace_directory_replaces_file() {
+    // bob creates file "x", alice creates "x/y". alice integrates later → incoming
+    // "x/y" wins, existing file "x" removed with namespace-wins.
+    let sb = Sandbox::new();
+    let early = sb.path().join("early");
+    let late = sb.path().join("late");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+
+    sb.run_in(&early, &["init"]);
+    sb.run_in(&late, &["init"]);
+    sb.run_in(&early, &["config", "contributor.id", "bob@x"]);
+    sb.run_in(&late, &["config", "contributor.id", "alice@x"]);
+
+    std::fs::write(early.join("x"), "ancestor\n").unwrap();
+    std::fs::create_dir(late.join("x")).unwrap();
+    std::fs::write(late.join("x/y"), "descendant\n").unwrap();
+
+    sb.run_in(&early, &["commit", "ancestor"]);
+    sb.run_in(&late, &["commit", "descendant"]);
+
+    let out = sb.run_in(&early, &["merge", late.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stderr, "warning: auto-resolved x: namespace-wins\n");
+
+    assert!(early.join("x").is_dir(), "x should be a directory");
+    let content = std::fs::read_to_string(early.join("x/y")).unwrap();
+    assert_eq!(content, "descendant\n");
+}
+
+#[test]
+fn merge_namespace_conflict_bidirectional_convergence() {
+    // Both directions of merge must produce the same result.
+    let sb = Sandbox::new();
+    let a = sb.path().join("a");
+    let b = sb.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+
+    sb.run_in(&a, &["init"]);
+    sb.run_in(&b, &["init"]);
+    sb.run_in(&a, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&b, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(a.join("p"), "file\n").unwrap();
+    std::fs::create_dir(b.join("p")).unwrap();
+    std::fs::write(b.join("p/q"), "nested\n").unwrap();
+
+    sb.run_in(&a, &["commit", "file"]);
+    sb.run_in(&b, &["commit", "nested"]);
+
+    let a_copy = sb.path().join("a-copy");
+    let b_copy = sb.path().join("b-copy");
+    copy_dir_all(&a, &a_copy);
+    copy_dir_all(&b, &b_copy);
+
+    let out_ab = sb.run_in(&a, &["merge", b.to_str().unwrap()]);
+    assert_eq!(out_ab.exit_code, 0, "A→B: {}", out_ab.stderr);
+
+    let out_ba = sb.run_in(&b_copy, &["merge", a_copy.to_str().unwrap()]);
+    assert_eq!(out_ba.exit_code, 0, "B→A: {}", out_ba.stderr);
+
+    assert_eq!(out_ab.stdout, out_ba.stdout, "versions must match");
+
+    // Check both trees have the same files
+    let a_has_file = a.join("p").is_file();
+    let b_has_file = b_copy.join("p").is_file();
+    assert_eq!(a_has_file, b_has_file, "file presence must match");
+
+    let a_has_nested = a.join("p/q").exists();
+    let b_has_nested = b_copy.join("p/q").exists();
+    assert_eq!(a_has_nested, b_has_nested, "nested presence must match");
+}
+
+#[test]
+fn merge_namespace_multiple_descendants_removed() {
+    // When a file replaces a directory, all files under that directory are removed.
+    let sb = Sandbox::new();
+    let a = sb.path().join("a");
+    let b = sb.path().join("b");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+
+    sb.run_in(&a, &["init"]);
+    sb.run_in(&b, &["init"]);
+    sb.run_in(&a, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&b, &["config", "contributor.id", "bob@x"]);
+
+    // alice creates file "d"
+    std::fs::write(a.join("d"), "file\n").unwrap();
+    // bob creates "d/x" and "d/y" (directory structure)
+    std::fs::create_dir(b.join("d")).unwrap();
+    std::fs::write(b.join("d/x"), "x\n").unwrap();
+    std::fs::write(b.join("d/y"), "y\n").unwrap();
+
+    sb.run_in(&a, &["commit", "file"]);
+    sb.run_in(&b, &["commit", "dir"]);
+
+    let out = sb.run_in(&a, &["merge", b.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+
+    // Both d/x and d/y should be removed with namespace-wins
+    assert!(out.stderr.contains("d/x: namespace-wins"));
+    assert!(out.stderr.contains("d/y: namespace-wins"));
+    assert!(a.join("d").is_file(), "d should be a file");
+    assert!(!a.join("d/x").exists());
+    assert!(!a.join("d/y").exists());
+}
+
+#[test]
+fn merge_namespace_overrides_per_path_rules() {
+    // A namespace conflict takes precedence over per-path rules.
+    // Both alice and bob base on a seed. alice creates "dir/child", bob creates "dir" (file).
+    // Without namespace resolution, "dir" and "dir/child" would be handled by per-path rules.
+    // With namespace resolution, the incoming path wins outright.
+    let sb = Sandbox::new();
+    let base = sb.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    sb.run_in(&base, &["init"]);
+    sb.run_in(&base, &["config", "contributor.id", "seed@x"]);
+    std::fs::write(base.join("other.txt"), "seed\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    let left = sb.path().join("left");
+    let right = sb.path().join("right");
+    copy_dir_all(&base, &left);
+    copy_dir_all(&base, &right);
+
+    sb.run_in(&left, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::create_dir(left.join("node")).unwrap();
+    std::fs::write(left.join("node/child"), "child\n").unwrap();
+    sb.run_in(&left, &["commit", "add dir"]);
+
+    std::fs::write(right.join("node"), "file\n").unwrap();
+    sb.run_in(&right, &["commit", "add file"]);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("namespace-wins"),
+        "stderr: {}",
+        out.stderr
+    );
+}
+
+// ── merge: three-way convergence ─────────────────────────────
+
+#[test]
+fn merge_three_way_text_convergence() {
+    let sb = Sandbox::new();
+    let base = sb.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    sb.run_in(&base, &["init"]);
+    sb.run_in(&base, &["config", "contributor.id", "seed@x"]);
+    std::fs::write(base.join("story.txt"), "start\nend\n").unwrap();
+    sb.run_in(&base, &["commit", "base"]);
+
+    let a = sb.path().join("a");
+    let b = sb.path().join("b");
+    let c = sb.path().join("c");
+    copy_dir_all(&base, &a);
+    copy_dir_all(&base, &b);
+    copy_dir_all(&base, &c);
+
+    sb.run_in(&a, &["config", "contributor.id", "a@x"]);
+    sb.run_in(&b, &["config", "contributor.id", "b@x"]);
+    sb.run_in(&c, &["config", "contributor.id", "c@x"]);
+
+    std::fs::write(a.join("story.txt"), "start\nA\nend\n").unwrap();
+    std::fs::write(b.join("story.txt"), "start\nB\nend\n").unwrap();
+    std::fs::write(c.join("story.txt"), "end\n").unwrap();
+
+    sb.run_in(&a, &["commit", "a"]);
+    sb.run_in(&b, &["commit", "b"]);
+    sb.run_in(&c, &["commit", "c"]);
+
+    // Test all 6 association orders: (A,B,C), (A,C,B), (B,A,C), (B,C,A), (C,A,B), (C,B,A)
+    let orders: [(&str, &str, &str); 6] = [
+        ("a", "b", "c"),
+        ("a", "c", "b"),
+        ("b", "a", "c"),
+        ("b", "c", "a"),
+        ("c", "a", "b"),
+        ("c", "b", "a"),
+    ];
+
+    let mut results: Vec<String> = Vec::new();
+    let sources: std::collections::HashMap<&str, &Path> =
+        [("a", a.as_path()), ("b", b.as_path()), ("c", c.as_path())]
+            .iter()
+            .copied()
+            .collect();
+
+    for (i, (first, second, third)) in orders.iter().enumerate() {
+        let agg = sb.path().join(format!("agg-{i}"));
+        copy_dir_all(sources[first], &agg);
+
+        let out1 = sb.run_in(&agg, &["merge", sources[second].to_str().unwrap()]);
+        assert_eq!(out1.exit_code, 0, "order {i} merge1: {}", out1.stderr);
+
+        let out2 = sb.run_in(&agg, &["merge", sources[third].to_str().unwrap()]);
+        assert_eq!(out2.exit_code, 0, "order {i} merge2: {}", out2.stderr);
+
+        let content = std::fs::read_to_string(agg.join("story.txt")).unwrap();
+        results.push(content);
+    }
+
+    // All 6 must produce identical content
+    for (i, r) in results.iter().enumerate().skip(1) {
+        assert_eq!(&results[0], r, "order 0 vs order {i} diverged");
+    }
+}
+
+#[test]
+fn merge_three_way_namespace_convergence() {
+    // Three-way merge with namespace conflicts must converge regardless of order.
+    let sb = Sandbox::new();
+    let a = sb.path().join("a");
+    let b = sb.path().join("b");
+    let c = sb.path().join("c");
+    std::fs::create_dir(&a).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    std::fs::create_dir(&c).unwrap();
+
+    sb.run_in(&a, &["init"]);
+    sb.run_in(&b, &["init"]);
+    sb.run_in(&c, &["init"]);
+    sb.run_in(&a, &["config", "contributor.id", "a@x"]);
+    sb.run_in(&b, &["config", "contributor.id", "b@x"]);
+    sb.run_in(&c, &["config", "contributor.id", "c@x"]);
+
+    // a creates file "n", b creates "n/child", c creates unrelated file
+    std::fs::write(a.join("n"), "file\n").unwrap();
+    std::fs::create_dir(b.join("n")).unwrap();
+    std::fs::write(b.join("n/child"), "child\n").unwrap();
+    std::fs::write(c.join("other"), "other\n").unwrap();
+
+    sb.run_in(&a, &["commit", "a"]);
+    sb.run_in(&b, &["commit", "b"]);
+    sb.run_in(&c, &["commit", "c"]);
+
+    // Merge in two different association orders and compare final versions
+    let agg1 = sb.path().join("agg1");
+    copy_dir_all(&a, &agg1);
+    let out = sb.run_in(&agg1, &["merge", b.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "agg1 merge1: {}", out.stderr);
+    let out = sb.run_in(&agg1, &["merge", c.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "agg1 merge2: {}", out.stderr);
+    let ver1 = out.stdout;
+
+    let agg2 = sb.path().join("agg2");
+    copy_dir_all(&c, &agg2);
+    let out = sb.run_in(&agg2, &["merge", b.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "agg2 merge1: {}", out.stderr);
+    let out = sb.run_in(&agg2, &["merge", a.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "agg2 merge2: {}", out.stderr);
+    let ver2 = out.stdout;
+
+    assert_eq!(ver1, ver2, "versions must match");
+
+    // Check trees converge: compare file presence
+    let agg1_has_n_file = agg1.join("n").is_file();
+    let agg2_has_n_file = agg2.join("n").is_file();
+    assert_eq!(
+        agg1_has_n_file, agg2_has_n_file,
+        "n file presence must match"
+    );
+
+    let agg1_has_n_child = agg1.join("n/child").exists();
+    let agg2_has_n_child = agg2.join("n/child").exists();
+    assert_eq!(
+        agg1_has_n_child, agg2_has_n_child,
+        "n/child presence must match"
+    );
+
+    let agg1_has_other = agg1.join("other").exists();
+    let agg2_has_other = agg2.join("other").exists();
+    assert_eq!(agg1_has_other, agg2_has_other, "other presence must match");
+}
+
 // ── merge: concurrent creates bidirectional ───────────────────────
 
 #[test]

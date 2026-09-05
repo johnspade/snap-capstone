@@ -1,4 +1,4 @@
-Status: ready-for-agent
+Status: done
 
 # 13 — Merge: namespace conflicts and convergence
 
@@ -19,15 +19,15 @@ These decisions override per-path rules. The authored result is prefix-free, so 
 
 ## Acceptance criteria
 
-- [ ] Namespace conflict detection (file vs ancestor/descendant)
-- [ ] Incoming path wins with `namespace-wins` warning
-- [ ] Conflicting current paths removed
-- [ ] Namespace resolution overrides per-path rules
-- [ ] Duplicate removal and warning collapsing
-- [ ] Three-way convergence: same tree regardless of merge association order
-- [ ] Property tests: random valid patch graphs, permuted imports → same result
-- [ ] Integration tests for file-replaces-directory and directory-replaces-file
-- [ ] YAML acceptance: `11-namespace-conflicts`, `18-three-way-convergence`
+- [x] Namespace conflict detection (file vs ancestor/descendant)
+- [x] Incoming path wins with `namespace-wins` warning
+- [x] Conflicting current paths removed
+- [x] Namespace resolution overrides per-path rules
+- [x] Duplicate removal and warning collapsing
+- [x] Three-way convergence: same tree regardless of merge association order
+- [x] Property tests: random valid patch graphs, permuted imports → same result
+- [x] Integration tests for file-replaces-directory and directory-replaces-file
+- [x] YAML acceptance: `11-namespace-conflicts`, `18-three-way-convergence`
 
 ## Blocked by
 
