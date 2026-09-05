@@ -960,3 +960,304 @@ fn merge_invalid_remote_exits_1() {
     let out = sb.run_in(&local, &["merge", "/tmp/nowhere"]);
     assert_eq!(out.exit_code, 1, "stderr: {}", out.stderr);
 }
+
+// ── merge: path-level conflict rules (§6.4) ──────────────────────
+
+fn setup_conflict_repos(sb: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = sb.path().join("base");
+    std::fs::create_dir(&base).unwrap();
+    sb.run_in(&base, &["init"]);
+    sb.run_in(&base, &["config", "contributor.id", "seed@x"]);
+    (base, sb.path().join("right"))
+}
+
+#[test]
+fn merge_rule1_identical_result_no_warning() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("f.txt"), "same\n").unwrap();
+    std::fs::write(right.join("f.txt"), "same\n").unwrap();
+    sb.run_in(&base, &["commit", "alice"]);
+    sb.run_in(&right, &["commit", "bob"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(
+        out.stderr, "",
+        "identical results should produce no warnings"
+    );
+    let content = std::fs::read_to_string(base.join("f.txt")).unwrap();
+    assert_eq!(content, "same\n");
+}
+
+#[test]
+fn merge_rule2_incoming_delete_wins() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("f.txt"), "modified\n").unwrap();
+    sb.run_in(&base, &["commit", "modify"]);
+
+    std::fs::remove_file(right.join("f.txt")).unwrap();
+    sb.run_in(&right, &["commit", "delete"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("delete-wins"), "stderr: {}", out.stderr);
+    assert!(!base.join("f.txt").exists());
+}
+
+#[test]
+fn merge_rule3_earlier_concurrent_delete_wins() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::remove_file(base.join("f.txt")).unwrap();
+    sb.run_in(&base, &["commit", "delete"]);
+
+    std::fs::write(right.join("f.txt"), "replaced\n").unwrap();
+    sb.run_in(&right, &["commit", "replace"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("delete-wins"), "stderr: {}", out.stderr);
+    assert!(!base.join("f.txt").exists());
+}
+
+#[test]
+fn merge_rule4_later_create_wins() {
+    let sb = Sandbox::new();
+    let left = sb.path().join("left");
+    let right = sb.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    sb.run_in(&left, &["init"]);
+    sb.run_in(&right, &["init"]);
+    sb.run_in(&left, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(left.join("same.txt"), "alice\n").unwrap();
+    std::fs::write(right.join("same.txt"), "bob\n").unwrap();
+    sb.run_in(&left, &["commit", "alice creates"]);
+    sb.run_in(&right, &["commit", "bob creates"]);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("later-create-wins"),
+        "stderr: {}",
+        out.stderr
+    );
+    let content = std::fs::read_to_string(left.join("same.txt")).unwrap();
+    assert_eq!(content, "alice\n");
+}
+
+#[test]
+fn merge_rule5_later_put_wins() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("f.txt"), [0x00, 0x01]).unwrap();
+    sb.run_in(&base, &["commit", "binary"]);
+
+    std::fs::write(right.join("f.txt"), "text edit\n").unwrap();
+    sb.run_in(&right, &["commit", "text"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("later-put-wins"),
+        "stderr: {}",
+        out.stderr
+    );
+    let content = std::fs::read(base.join("f.txt")).unwrap();
+    assert_eq!(content, [0x00, 0x01], "later put content should win");
+}
+
+#[test]
+fn merge_rule6_put_wins_incompatible_current() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "bob@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "alice@x"]);
+
+    std::fs::write(base.join("f.txt"), [0x00, 0xFF]).unwrap();
+    sb.run_in(&base, &["commit", "binary"]);
+
+    std::fs::write(right.join("f.txt"), "edited\n").unwrap();
+    sb.run_in(&right, &["commit", "text edit"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("put-wins"), "stderr: {}", out.stderr);
+    let content = std::fs::read(base.join("f.txt")).unwrap();
+    assert_eq!(content, [0x00, 0xFF]);
+}
+
+#[test]
+fn merge_warnings_sorted_by_path_then_reason() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("beta.txt"), "original\n").unwrap();
+    std::fs::write(base.join("alpha.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("beta.txt"), "left\n").unwrap();
+    std::fs::write(base.join("alpha.txt"), "left\n").unwrap();
+    sb.run_in(&base, &["commit", "left"]);
+
+    std::fs::remove_file(right.join("beta.txt")).unwrap();
+    std::fs::remove_file(right.join("alpha.txt")).unwrap();
+    sb.run_in(&right, &["commit", "delete both"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    let lines: Vec<&str> = out.stderr.lines().collect();
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("alpha.txt"), "first: {}", lines[0]);
+    assert!(lines[1].contains("beta.txt"), "second: {}", lines[1]);
+}
+
+#[test]
+fn merge_remerge_emits_no_new_warnings() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("f.txt"), "modified\n").unwrap();
+    sb.run_in(&base, &["commit", "modify"]);
+
+    std::fs::remove_file(right.join("f.txt")).unwrap();
+    sb.run_in(&right, &["commit", "delete"]);
+
+    let out1 = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out1.exit_code, 0);
+    assert!(out1.stderr.contains("delete-wins"));
+
+    let out2 = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out2.exit_code, 0);
+    assert_eq!(out2.stderr, "", "re-merge should emit no warnings");
+}
+
+// ── merge: dot collision ──────────────────────────────────────────
+
+#[test]
+fn merge_dot_collision_fails_before_mutation() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::create_dir(&remote).unwrap();
+
+    sb.run_in(&local, &["init"]);
+    sb.run_in(&local, &["config", "contributor.id", "a@x"]);
+    std::fs::write(local.join("f.txt"), "local\n").unwrap();
+    sb.run_in(&local, &["commit", "local"]);
+
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "a@x"]);
+    std::fs::write(remote.join("f.txt"), "different\n").unwrap();
+    sb.run_in(&remote, &["commit", "remote"]);
+
+    let repo_before = std::fs::read_to_string(local.join(".snap/repository.json")).unwrap();
+
+    let out = sb.run_in(&local, &["merge", remote.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 1);
+    assert!(
+        out.stderr.contains("patch collision"),
+        "stderr: {}",
+        out.stderr
+    );
+
+    let repo_after = std::fs::read_to_string(local.join(".snap/repository.json")).unwrap();
+    assert_eq!(repo_before, repo_after, "repository must not be mutated");
+    assert_eq!(
+        std::fs::read_to_string(local.join("f.txt")).unwrap(),
+        "local\n",
+        "working tree must not be mutated"
+    );
+}
+
+// ── merge: concurrent creates bidirectional ───────────────────────
+
+#[test]
+fn merge_concurrent_creates_converge_bidirectionally() {
+    let sb = Sandbox::new();
+    let alice = sb.path().join("alice");
+    let bob = sb.path().join("bob");
+    std::fs::create_dir(&alice).unwrap();
+    std::fs::create_dir(&bob).unwrap();
+
+    sb.run_in(&alice, &["init"]);
+    sb.run_in(&bob, &["init"]);
+    sb.run_in(&alice, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&bob, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(alice.join("same.txt"), "alice\n").unwrap();
+    std::fs::write(bob.join("same.txt"), "bob\n").unwrap();
+    sb.run_in(&alice, &["commit", "alice"]);
+    sb.run_in(&bob, &["commit", "bob"]);
+
+    let alice_copy = sb.path().join("alice-copy");
+    copy_dir_all(&alice, &alice_copy);
+
+    let out_ab = sb.run_in(&alice, &["merge", bob.to_str().unwrap()]);
+    assert_eq!(out_ab.exit_code, 0, "A→B: {}", out_ab.stderr);
+    assert!(out_ab.stderr.contains("later-create-wins"));
+
+    let out_ba = sb.run_in(&bob, &["merge", alice_copy.to_str().unwrap()]);
+    assert_eq!(out_ba.exit_code, 0, "B→A: {}", out_ba.stderr);
+    assert!(out_ba.stderr.contains("later-create-wins"));
+
+    let alice_content = std::fs::read_to_string(alice.join("same.txt")).unwrap();
+    let bob_content = std::fs::read_to_string(bob.join("same.txt")).unwrap();
+    assert_eq!(
+        alice_content, bob_content,
+        "trees must converge after merge in both directions"
+    );
+}

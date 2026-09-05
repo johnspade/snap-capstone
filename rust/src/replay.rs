@@ -1408,5 +1408,96 @@ mod proptests {
             prop_assert_eq!(r1.tree, r2.tree, "tree must be identical regardless of input order");
             prop_assert_eq!(r1.warnings, r2.warnings, "warnings must be identical regardless of input order");
         }
+
+        #[test]
+        fn concurrent_creates_commute(
+            a_name in prop::sample::select(vec!["a@x", "c@z"]),
+            b_name in prop::sample::select(vec!["b@y", "d@w"]),
+            a_content in proptest::collection::vec(proptest::num::u8::ANY, 1..32),
+            b_content in proptest::collection::vec(proptest::num::u8::ANY, 1..32),
+        ) {
+            prop_assume!(a_content != b_content);
+            let a_cid = ContributorId::new(a_name).unwrap();
+            let b_cid = ContributorId::new(b_name).unwrap();
+            let patches = vec![
+                Patch {
+                    author: a_cid,
+                    revision: 1,
+                    base: Version::empty(),
+                    message: "a".to_owned(),
+                    changes: vec![Change::Put { path: "f".to_owned(), content: a_content }],
+                },
+                Patch {
+                    author: b_cid,
+                    revision: 1,
+                    base: Version::empty(),
+                    message: "b".to_owned(),
+                    changes: vec![Change::Put { path: "f".to_owned(), content: b_content }],
+                },
+            ];
+            let target = patches[0].result_version().join(&patches[1].result_version());
+            let r1 = replay(&patches, &target).unwrap();
+
+            let reversed = vec![patches[1].clone(), patches[0].clone()];
+            let r2 = replay(&reversed, &target).unwrap();
+
+            prop_assert_eq!(&r1.tree, &r2.tree, "concurrent creates must commute");
+            prop_assert_eq!(&r1.warnings, &r2.warnings, "warnings must commute");
+            prop_assert!(r1.warnings.iter().any(|(_, reason)| reason == "later-create-wins"));
+        }
+
+        #[test]
+        fn delete_wins_regardless_of_input_order(
+            modifier_name in prop::sample::select(vec!["b@y", "d@w"]),
+            deleter_name in prop::sample::select(vec!["c@z", "e@v"]),
+        ) {
+            let seed = ContributorId::new("a@x").unwrap();
+            let modifier = ContributorId::new(modifier_name).unwrap();
+            let deleter = ContributorId::new(deleter_name).unwrap();
+            let base_patch = Patch {
+                author: seed,
+                revision: 1,
+                base: Version::empty(),
+                message: "seed".to_owned(),
+                changes: vec![Change::Put { path: "f".to_owned(), content: b"original".to_vec() }],
+            };
+            let base_ver = base_patch.result_version();
+            let mod_patch = Patch {
+                author: modifier,
+                revision: 1,
+                base: base_ver.clone(),
+                message: "modify".to_owned(),
+                changes: vec![Change::Put { path: "f".to_owned(), content: b"modified".to_vec() }],
+            };
+            let del_patch = Patch {
+                author: deleter,
+                revision: 1,
+                base: base_ver,
+                message: "delete".to_owned(),
+                changes: vec![Change::Delete { path: "f".to_owned() }],
+            };
+            let target = base_patch.result_version()
+                .join(&mod_patch.result_version())
+                .join(&del_patch.result_version());
+
+            let patches1 = vec![base_patch.clone(), mod_patch.clone(), del_patch.clone()];
+            let patches2 = vec![base_patch, del_patch, mod_patch];
+
+            let r1 = replay(&patches1, &target).unwrap();
+            let r2 = replay(&patches2, &target).unwrap();
+
+            prop_assert!(!r1.tree.contains_key("f"), "file must be deleted");
+            prop_assert_eq!(&r1.tree, &r2.tree, "delete-wins must be input-order independent");
+            prop_assert!(r1.warnings.iter().any(|(_, reason)| reason == "delete-wins"));
+        }
+
+        #[test]
+        fn warnings_are_always_sorted((patches, target) in arb_simple_patch_set()) {
+            let result = replay(&patches, &target).unwrap();
+            let warns: Vec<_> = result.warnings.iter().collect();
+            for w in warns.windows(2) {
+                prop_assert!(w[0] <= w[1], "warnings not sorted: {:?} > {:?}", w[0], w[1]);
+            }
+        }
     }
 }
