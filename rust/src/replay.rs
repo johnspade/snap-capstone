@@ -1499,5 +1499,146 @@ mod proptests {
                 prop_assert!(w[0] <= w[1], "warnings not sorted: {:?} > {:?}", w[0], w[1]);
             }
         }
+
+        #[test]
+        fn namespace_conflict_incoming_wins(
+            file_suffix in prop::sample::select(vec!["a", "b", "c"]),
+        ) {
+            let nested_path = format!("d/{file_suffix}");
+            let desc_patch = Patch {
+                author: ContributorId::new("b@y").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "descendant".to_owned(),
+                changes: vec![Change::Put { path: nested_path, content: b"nested\n".to_vec() }],
+            };
+            let file_patch = Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "file".to_owned(),
+                changes: vec![Change::Put { path: "d".to_owned(), content: b"file\n".to_vec() }],
+            };
+
+            let target = desc_patch.result_version().join(&file_patch.result_version());
+
+            let r1 = replay(&[desc_patch.clone(), file_patch.clone()], &target).unwrap();
+            let r2 = replay(&[file_patch, desc_patch], &target).unwrap();
+
+            prop_assert_eq!(&r1.tree, &r2.tree, "namespace conflict must be input-order independent");
+            prop_assert_eq!(&r1.warnings, &r2.warnings, "warnings must be input-order independent");
+            prop_assert!(
+                r1.warnings.iter().any(|(_, reason)| reason == "namespace-wins"),
+                "namespace-wins warning must be emitted"
+            );
+        }
+
+        #[test]
+        fn three_way_convergence(
+            a_content in "[a-z]{1,8}\n",
+            b_content in "[a-z]{1,8}\n",
+            c_content in "[a-z]{1,8}\n",
+        ) {
+            let a_patch = Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "a".to_owned(),
+                changes: vec![Change::Put { path: "a".to_owned(), content: a_content.into_bytes() }],
+            };
+            let b_patch = Patch {
+                author: ContributorId::new("b@y").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "b".to_owned(),
+                changes: vec![Change::Put { path: "b".to_owned(), content: b_content.into_bytes() }],
+            };
+            let c_patch = Patch {
+                author: ContributorId::new("c@z").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "c".to_owned(),
+                changes: vec![Change::Put { path: "c".to_owned(), content: c_content.into_bytes() }],
+            };
+
+            let target = a_patch.result_version()
+                .join(&b_patch.result_version())
+                .join(&c_patch.result_version());
+
+            let all = [a_patch, b_patch, c_patch];
+            let perms: [(usize, usize, usize); 6] = [
+                (0,1,2), (0,2,1), (1,0,2), (1,2,0), (2,0,1), (2,1,0),
+            ];
+
+            let baseline = replay(&[all[0].clone(), all[1].clone(), all[2].clone()], &target).unwrap();
+
+            for (i, (x, y, z)) in perms.iter().enumerate().skip(1) {
+                let patches = vec![all[*x].clone(), all[*y].clone(), all[*z].clone()];
+                let result = replay(&patches, &target).unwrap();
+                prop_assert_eq!(
+                    &baseline.tree, &result.tree,
+                    "permutation {}: tree must match baseline", i
+                );
+                prop_assert_eq!(
+                    &baseline.warnings, &result.warnings,
+                    "permutation {}: warnings must match baseline", i
+                );
+            }
+        }
+
+        #[test]
+        fn three_way_convergence_with_conflict(
+            a_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+            b_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+            c_content in proptest::collection::vec(proptest::num::u8::ANY, 1..16),
+        ) {
+            prop_assume!(a_content != b_content || b_content != c_content);
+
+            let a_patch = Patch {
+                author: ContributorId::new("a@x").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "a".to_owned(),
+                changes: vec![Change::Put { path: "f".to_owned(), content: a_content }],
+            };
+            let b_patch = Patch {
+                author: ContributorId::new("b@y").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "b".to_owned(),
+                changes: vec![Change::Put { path: "f".to_owned(), content: b_content }],
+            };
+            let c_patch = Patch {
+                author: ContributorId::new("c@z").unwrap(),
+                revision: 1,
+                base: Version::empty(),
+                message: "c".to_owned(),
+                changes: vec![Change::Put { path: "f".to_owned(), content: c_content }],
+            };
+
+            let target = a_patch.result_version()
+                .join(&b_patch.result_version())
+                .join(&c_patch.result_version());
+
+            let all = [a_patch, b_patch, c_patch];
+            let perms: [(usize, usize, usize); 6] = [
+                (0,1,2), (0,2,1), (1,0,2), (1,2,0), (2,0,1), (2,1,0),
+            ];
+
+            let baseline = replay(&[all[0].clone(), all[1].clone(), all[2].clone()], &target).unwrap();
+
+            for (i, (x, y, z)) in perms.iter().enumerate().skip(1) {
+                let patches = vec![all[*x].clone(), all[*y].clone(), all[*z].clone()];
+                let result = replay(&patches, &target).unwrap();
+                prop_assert_eq!(
+                    &baseline.tree, &result.tree,
+                    "permutation {}: tree must match baseline", i
+                );
+                prop_assert_eq!(
+                    &baseline.warnings, &result.warnings,
+                    "permutation {}: warnings must match baseline", i
+                );
+            }
+        }
     }
 }
