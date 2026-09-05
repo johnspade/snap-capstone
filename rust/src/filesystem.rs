@@ -12,7 +12,7 @@ pub enum FsError {
     InvalidPath(String),
     #[error("prefix conflict: {path} and {nested}")]
     PrefixConflict { path: String, nested: String },
-    #[error("snap: unsupported working tree entry: {0}")]
+    #[error("unsupported working tree entry: {0}")]
     UnsupportedEntry(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),

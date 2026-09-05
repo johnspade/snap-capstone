@@ -290,6 +290,79 @@ pub fn revert<O: std::io::Write, E: std::io::Write>(
     Ok(())
 }
 
+pub fn merge<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    remote_path: &str,
+) -> Result<(), SnapError> {
+    let repo_root = require_repo()?;
+    let local_repo = load_repo(&repo_root)?;
+
+    let working_tree = filesystem::scan_working_tree(&repo_root)
+        .map_err(|e| SnapError::Expected(e.to_string()))?;
+    let local_tree = replay_to_frontier(&local_repo)?;
+    if !filesystem::is_clean(&working_tree, &local_tree) {
+        return Err(SnapError::Expected("working tree is dirty".to_owned()));
+    }
+
+    let cwd = std::env::current_dir().map_err(|e| SnapError::Internal(e.to_string()))?;
+    let remote_root = cwd.join(remote_path);
+    let remote_repo = load_repo(&remote_root).map_err(|e| match e {
+        SnapError::Internal(msg) => SnapError::Expected(msg),
+        SnapError::Expected(_) => e,
+    })?;
+
+    let merged = union_repositories(&local_repo, &remote_repo)?;
+
+    let local_result = replay::replay(&local_repo.patches, &local_repo.frontier)
+        .map_err(|e| SnapError::Internal(e.to_string()))?;
+    let merged_result = replay::replay(&merged.patches, &merged.frontier)
+        .map_err(|e| SnapError::Internal(e.to_string()))?;
+
+    let new_warnings: Vec<&(String, String)> = merged_result
+        .warnings
+        .iter()
+        .filter(|w| !local_result.warnings.contains(w))
+        .collect();
+
+    for (path, reason) in &new_warnings {
+        writer.stderr(&format!("warning: auto-resolved {path}: {reason}\n"));
+    }
+
+    filesystem::materialize(&repo_root, &merged_result.tree)
+        .map_err(|e| SnapError::Internal(e.to_string()))?;
+    atomic_write_repo(&repo_root, &merged)?;
+
+    writer.stdout(&format!("{}\n", merged.frontier));
+    Ok(())
+}
+
+fn union_repositories(local: &Repository, remote: &Repository) -> Result<Repository, SnapError> {
+    let mut patches = local.patches.clone();
+
+    for remote_patch in &remote.patches {
+        let existing = patches
+            .iter()
+            .find(|p| p.author == remote_patch.author && p.revision == remote_patch.revision);
+        match existing {
+            Some(local_patch) => {
+                if local_patch != remote_patch {
+                    return Err(SnapError::Expected(format!(
+                        "patch collision: {} revision {}",
+                        remote_patch.author.as_str(),
+                        remote_patch.revision
+                    )));
+                }
+            }
+            None => {
+                patches.push(remote_patch.clone());
+            }
+        }
+    }
+
+    let frontier = local.frontier.join(&remote.frontier);
+
+    Ok(Repository { frontier, patches })
+}
 pub fn require_repo_stub(_cmd: &str) -> Result<(), SnapError> {
     require_repo()?;
     Err(SnapError::Expected("not implemented".to_owned()))
@@ -659,12 +732,164 @@ fn write_diff_token<O: std::io::Write, E: std::io::Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use snap::text::{EditOp, EditScript};
+    use snap::version::ContributorId;
 
     fn tree_from(entries: &[(&str, &[u8])]) -> Tree {
         entries
             .iter()
             .map(|(k, v)| ((*k).to_owned(), v.to_vec()))
             .collect()
+    }
+
+    fn cid(s: &str) -> ContributorId {
+        ContributorId::new(s).unwrap()
+    }
+
+    fn ver(s: &str) -> snap::version::Version {
+        s.parse().unwrap()
+    }
+
+    fn make_patch(
+        author: &str,
+        revision: u64,
+        base: &str,
+        message: &str,
+        changes: Vec<Change>,
+    ) -> repository::Patch {
+        repository::Patch {
+            author: cid(author),
+            revision,
+            base: ver(base),
+            message: message.to_owned(),
+            changes,
+        }
+    }
+
+    fn text_change(path: &str, ops: Vec<EditOp>) -> Change {
+        Change::Text {
+            path: path.to_owned(),
+            edit: EditScript::new(ops).unwrap(),
+        }
+    }
+
+    // ── union_repositories ────────────────────────────────────
+
+    #[test]
+    fn union_disjoint_patches() {
+        let local = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![make_patch(
+                "a@x",
+                1,
+                "()",
+                "a1",
+                vec![text_change(
+                    "a.txt",
+                    vec![EditOp::Insert(vec!["a\n".to_owned()])],
+                )],
+            )],
+        };
+        let remote = Repository {
+            frontier: ver("(b@y->1)"),
+            patches: vec![make_patch(
+                "b@y",
+                1,
+                "()",
+                "b1",
+                vec![text_change(
+                    "b.txt",
+                    vec![EditOp::Insert(vec!["b\n".to_owned()])],
+                )],
+            )],
+        };
+        let merged = union_repositories(&local, &remote).unwrap();
+        assert_eq!(merged.patches.len(), 2);
+        assert_eq!(merged.frontier, ver("(a@x->1,b@y->1)"));
+    }
+
+    #[test]
+    fn union_overlapping_identical_patches() {
+        let patch = make_patch(
+            "a@x",
+            1,
+            "()",
+            "shared",
+            vec![text_change(
+                "f.txt",
+                vec![EditOp::Insert(vec!["shared\n".to_owned()])],
+            )],
+        );
+        let local = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![patch.clone()],
+        };
+        let remote = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![patch],
+        };
+        let merged = union_repositories(&local, &remote).unwrap();
+        assert_eq!(merged.patches.len(), 1);
+        assert_eq!(merged.frontier, ver("(a@x->1)"));
+    }
+
+    #[test]
+    fn union_dot_collision_errors() {
+        let local = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![make_patch(
+                "a@x",
+                1,
+                "()",
+                "local",
+                vec![text_change(
+                    "f.txt",
+                    vec![EditOp::Insert(vec!["local\n".to_owned()])],
+                )],
+            )],
+        };
+        let remote = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![make_patch(
+                "a@x",
+                1,
+                "()",
+                "remote",
+                vec![text_change(
+                    "f.txt",
+                    vec![EditOp::Insert(vec!["remote\n".to_owned()])],
+                )],
+            )],
+        };
+        let err = union_repositories(&local, &remote).unwrap_err();
+        match err {
+            SnapError::Expected(msg) => assert!(msg.contains("patch collision")),
+            SnapError::Internal(_) => panic!("expected Expected error"),
+        }
+    }
+
+    #[test]
+    fn union_already_contained_is_idempotent() {
+        let patch = make_patch(
+            "a@x",
+            1,
+            "()",
+            "a1",
+            vec![text_change(
+                "f.txt",
+                vec![EditOp::Insert(vec!["hello\n".to_owned()])],
+            )],
+        );
+        let local = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![patch.clone()],
+        };
+        let remote = Repository {
+            frontier: ver("(a@x->1)"),
+            patches: vec![patch],
+        };
+        let merged = union_repositories(&local, &remote).unwrap();
+        assert_eq!(merged, local);
     }
 
     // ── escape_log_message ────────────────────────────────────

@@ -762,3 +762,201 @@ fn revert_without_repo_fails() {
     assert_eq!(out.exit_code, 1);
     assert!(out.stderr.contains("not a Snap repository"));
 }
+
+// ── merge ─────────────────────────────────────────────────────────
+
+fn setup_seeded_repos(sb: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf) {
+    let left = sb.path().join("left");
+    std::fs::create_dir(&left).unwrap();
+    sb.run_in(&left, &["init"]);
+    sb.run_in(&left, &["config", "contributor.id", "seed@x"]);
+    std::fs::write(left.join("notes.txt"), "base\n").unwrap();
+    sb.run_in(&left, &["commit", "base"]);
+
+    // copy_tree: copy left to right
+    let right = sb.path().join("right");
+    copy_dir_all(&left, &right);
+
+    sb.run_in(&left, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    (left, right)
+}
+
+fn copy_dir_all(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let ft = entry.file_type().unwrap();
+        let target = to.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_all(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn merge_concurrent_text_edits() {
+    let sb = Sandbox::new();
+    let (left, right) = setup_seeded_repos(&sb);
+
+    std::fs::write(left.join("notes.txt"), "base\nleft\n").unwrap();
+    std::fs::write(right.join("notes.txt"), "base\nright\n").unwrap();
+
+    sb.run_in(&left, &["commit", "left"]);
+    sb.run_in(&right, &["commit", "right"]);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, "(alice@x->1,bob@x->1,seed@x->1)\n");
+    assert_eq!(out.stderr, "");
+
+    let content = std::fs::read_to_string(left.join("notes.txt")).unwrap();
+    assert_eq!(content, "base\nright\nleft\n");
+}
+
+#[test]
+fn merge_bidirectional_convergence() {
+    let sb = Sandbox::new();
+    let (left, right) = setup_seeded_repos(&sb);
+
+    std::fs::write(left.join("notes.txt"), "base\nleft\n").unwrap();
+    std::fs::write(right.join("notes.txt"), "base\nright\n").unwrap();
+
+    sb.run_in(&left, &["commit", "left"]);
+    sb.run_in(&right, &["commit", "right"]);
+
+    let out1 = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out1.exit_code, 0, "merge into left failed: {}", out1.stderr);
+    let out2 = sb.run_in(&right, &["merge", left.to_str().unwrap()]);
+    assert_eq!(
+        out2.exit_code, 0,
+        "merge into right failed: {}",
+        out2.stderr
+    );
+
+    let left_notes = std::fs::read_to_string(left.join("notes.txt")).unwrap();
+    let right_notes = std::fs::read_to_string(right.join("notes.txt")).unwrap();
+    assert_eq!(left_notes, right_notes, "trees must converge");
+}
+
+#[test]
+fn merge_idempotent() {
+    let sb = Sandbox::new();
+    let (left, right) = setup_seeded_repos(&sb);
+
+    std::fs::write(left.join("notes.txt"), "base\nleft\n").unwrap();
+    std::fs::write(right.join("notes.txt"), "base\nright\n").unwrap();
+
+    sb.run_in(&left, &["commit", "left"]);
+    sb.run_in(&right, &["commit", "right"]);
+
+    let out1 = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out1.exit_code, 0, "first merge failed: {}", out1.stderr);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "re-merge failed: {}", out.stderr);
+    assert_eq!(out.stdout, "(alice@x->1,bob@x->1,seed@x->1)\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn merge_equal_history_is_noop() {
+    let sb = Sandbox::new();
+    let left = sb.path().join("left");
+    std::fs::create_dir(&left).unwrap();
+    sb.run_in(&left, &["init"]);
+
+    let right = sb.path().join("right");
+    copy_dir_all(&left, &right);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "merge failed: {}", out.stderr);
+    assert_eq!(out.stdout, "()\n");
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn merge_refuses_dirty_tree() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "r@x"]);
+    std::fs::write(remote.join("f.txt"), "remote\n").unwrap();
+    sb.run_in(&remote, &["commit", "remote"]);
+
+    std::fs::write(local.join("dirty.txt"), "dirty\n").unwrap();
+
+    let out = sb.run_in(&local, &["merge", remote.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stderr, "snap: working tree is dirty\n");
+    assert_eq!(out.stdout, "");
+
+    // Verify no mutation occurred
+    assert!(std::fs::read_to_string(local.join("dirty.txt")).unwrap() == "dirty\n");
+    assert!(!local.join("f.txt").exists());
+}
+
+#[test]
+fn merge_refuses_symlink_in_working_tree() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    sb.run_in(&remote, &["init"]);
+
+    std::os::unix::fs::symlink("nonexistent", local.join("link")).unwrap();
+
+    let out = sb.run_in(&local, &["merge", remote.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("unsupported working tree entry: link"));
+}
+
+#[test]
+fn merge_identical_concurrent_changes_no_warning() {
+    let sb = Sandbox::new();
+    let (left, right) = setup_seeded_repos(&sb);
+
+    // Both make the exact same change
+    std::fs::write(left.join("notes.txt"), "base\nsame\n").unwrap();
+    std::fs::write(right.join("notes.txt"), "base\nsame\n").unwrap();
+
+    sb.run_in(&left, &["commit", "identical"]);
+    sb.run_in(&right, &["commit", "identical"]);
+
+    let out = sb.run_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "merge failed: {}", out.stderr);
+    assert_eq!(out.stderr, "");
+
+    let content = std::fs::read_to_string(left.join("notes.txt")).unwrap();
+    assert_eq!(content, "base\nsame\n");
+}
+
+#[test]
+fn merge_no_repo_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run(&["merge", "/tmp/nowhere"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("not a Snap repository"));
+}
+
+#[test]
+fn merge_invalid_remote_exits_1() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let out = sb.run_in(&local, &["merge", "/tmp/nowhere"]);
+    assert_eq!(out.exit_code, 1, "stderr: {}", out.stderr);
+}
