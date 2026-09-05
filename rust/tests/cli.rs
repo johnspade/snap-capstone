@@ -972,6 +972,30 @@ fn setup_conflict_repos(sb: &Sandbox) -> (std::path::PathBuf, std::path::PathBuf
 }
 
 #[test]
+fn merge_rule1_identical_result_no_warning() {
+    let sb = Sandbox::new();
+    let (base, right) = setup_conflict_repos(&sb);
+
+    std::fs::write(base.join("f.txt"), "original\n").unwrap();
+    sb.run_in(&base, &["commit", "seed"]);
+
+    copy_dir_all(&base, &right);
+    sb.run_in(&base, &["config", "contributor.id", "alice@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "bob@x"]);
+
+    std::fs::write(base.join("f.txt"), "same\n").unwrap();
+    std::fs::write(right.join("f.txt"), "same\n").unwrap();
+    sb.run_in(&base, &["commit", "alice"]);
+    sb.run_in(&right, &["commit", "bob"]);
+
+    let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stderr, "", "identical results should produce no warnings");
+    let content = std::fs::read_to_string(base.join("f.txt")).unwrap();
+    assert_eq!(content, "same\n");
+}
+
+#[test]
 fn merge_rule2_incoming_delete_wins() {
     let sb = Sandbox::new();
     let (base, right) = setup_conflict_repos(&sb);
@@ -1072,6 +1096,8 @@ fn merge_rule5_later_put_wins() {
         "stderr: {}",
         out.stderr
     );
+    let content = std::fs::read(base.join("f.txt")).unwrap();
+    assert_eq!(content, [0x00, 0x01], "later put content should win");
 }
 
 #[test]
