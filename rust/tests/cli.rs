@@ -990,7 +990,10 @@ fn merge_rule1_identical_result_no_warning() {
 
     let out = sb.run_in(&base, &["merge", right.to_str().unwrap()]);
     assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
-    assert_eq!(out.stderr, "", "identical results should produce no warnings");
+    assert_eq!(
+        out.stderr, "",
+        "identical results should produce no warnings"
+    );
     let content = std::fs::read_to_string(base.join("f.txt")).unwrap();
     assert_eq!(content, "same\n");
 }
