@@ -1,14 +1,39 @@
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use snap::writer::Writer;
+use snap::writer::{ColorMode, Writer, resolve_color_modes};
 
 mod commands;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let snap_color = std::env::var("SNAP_COLOR").ok();
+    let no_color_present = std::env::var_os("NO_COLOR").is_some();
+
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
-    let mut writer = Writer::new(stdout.lock(), stderr.lock());
+
+    let (stdout_mode, stderr_mode) = match resolve_color_modes(
+        snap_color.as_deref(),
+        no_color_present,
+        stdout.is_terminal(),
+        stderr.is_terminal(),
+    ) {
+        Ok(modes) => modes,
+        Err(msg) => {
+            let mut writer = Writer::new(
+                stdout.lock(),
+                stderr.lock(),
+                ColorMode::Plain,
+                ColorMode::Plain,
+            );
+            writer.error(&msg);
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut writer = Writer::new(stdout.lock(), stderr.lock(), stdout_mode, stderr_mode);
     match run(&args, &mut writer) {
         Ok(()) => ExitCode::from(0),
         Err(SnapError::Expected(msg)) => {

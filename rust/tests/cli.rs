@@ -25,13 +25,27 @@ impl Sandbox {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.run_with_env(cwd, args, &[("NO_COLOR", "1")])
+    }
+
+    fn run_color_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.run_with_env(cwd, args, &[("SNAP_COLOR", "always")])
+    }
+
+    fn run_env_in(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        self.run_with_env(cwd, args, env)
+    }
+
+    fn run_with_env(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(snap_bin());
         cmd.args(args)
             .current_dir(cwd)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("HOME", self.dir.path().join("home"))
-            .env("NO_COLOR", "1");
+            .env("HOME", self.dir.path().join("home"));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
         if let Ok(val) = std::env::var("LLVM_PROFILE_FILE") {
             cmd.env("LLVM_PROFILE_FILE", val);
         }
@@ -1913,4 +1927,359 @@ fn remote_merge_non_200_rejected() {
     assert!(out.stderr.contains("HTTP 302"), "stderr: {}", out.stderr);
 
     handle.join().unwrap();
+}
+
+// ── Terminal presentation (§7.11) ────────────────────────────────
+
+fn s(code: u8, text: &str) -> String {
+    format!("\x1b[{code}m{text}\x1b[0m")
+}
+
+#[test]
+fn terminal_version_is_bold() {
+    let sb = Sandbox::new();
+    let out = sb.run_color_in(sb.path(), &["--version"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, format!("{}\n", s(1, "snap 1.0.0")));
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn terminal_init_success_line() {
+    let sb = Sandbox::new();
+    let out = sb.run_color_in(sb.path(), &["init", "repo"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{} {} {}\n",
+            s(32, "✓"),
+            s(1, "Initialized repository"),
+            s(36, "()")
+        )
+    );
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn terminal_commit_success_line() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+
+    let out = sb.run_color_in(&repo, &["commit", "first"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{} {} {}\n",
+            s(32, "✓"),
+            s(1, "Committed"),
+            s(36, "(a@x->1)")
+        )
+    );
+}
+
+#[test]
+fn terminal_status_clean() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let out = sb.run_color_in(&repo, &["status"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{}  {}\n\n  {} Working tree clean\n",
+            s(1, "Snap status"),
+            s(36, "()"),
+            s(32, "✓")
+        )
+    );
+}
+
+#[test]
+fn terminal_status_dirty() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+
+    let out = sb.run_color_in(&repo, &["status"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{}  {}\n\n  {} f.txt {}\n",
+            s(1, "Snap status"),
+            s(36, "()"),
+            s(32, "+"),
+            s(2, "(added)")
+        )
+    );
+}
+
+#[test]
+fn terminal_log_single_entry() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+
+    let out = sb.run_color_in(&repo, &["log"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{} {}\n  {} {} {}\n",
+            s(36, "●"),
+            s(1, "first"),
+            s(36, "(a@x->1)"),
+            s(2, "by"),
+            s(35, "a@x")
+        )
+    );
+}
+
+#[test]
+fn terminal_log_multiple_entries_separated() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "v1\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+    std::fs::write(repo.join("f.txt"), "v2\n").unwrap();
+    sb.run_in(&repo, &["commit", "second"]);
+
+    let out = sb.run_color_in(&repo, &["log"]);
+    assert_eq!(out.exit_code, 0);
+    let expected = format!(
+        "{} {}\n  {} {} {}\n\n{} {}\n  {} {} {}\n",
+        s(36, "●"),
+        s(1, "second"),
+        s(36, "(a@x->2)"),
+        s(2, "by"),
+        s(35, "a@x"),
+        s(36, "●"),
+        s(1, "first"),
+        s(36, "(a@x->1)"),
+        s(2, "by"),
+        s(35, "a@x"),
+    );
+    assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn terminal_diff_styled_lines() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "context\nold\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+    std::fs::write(repo.join("f.txt"), "context\nnew\n").unwrap();
+
+    let out = sb.run_color_in(&repo, &["diff"]);
+    assert_eq!(out.exit_code, 0);
+    let expected = format!(
+        "{}\n{}\n{}\n context\n{}\n{}\n",
+        s(1, "--- a/f.txt"),
+        s(1, "+++ b/f.txt"),
+        s(36, "@@ -1,2 +1,2 @@"),
+        s(31, "-old"),
+        s(32, "+new"),
+    );
+    assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn terminal_diff_binary_and_no_newline() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.bin"), [0x00, 0xFF]).unwrap();
+    std::fs::write(repo.join("tail.txt"), "tail").unwrap();
+
+    let out = sb.run_color_in(&repo, &["diff"]);
+    assert_eq!(out.exit_code, 0);
+    let expected = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        s(33, "Binary files /dev/null and b/f.bin differ"),
+        s(1, "--- /dev/null"),
+        s(1, "+++ b/tail.txt"),
+        s(36, "@@ -1,0 +1,1 @@"),
+        s(32, "+tail"),
+        s(2, "\\ No newline at end of file"),
+    );
+    assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn terminal_error_is_styled() {
+    let sb = Sandbox::new();
+    let out = sb.run_color_in(sb.path(), &["unknown"]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(
+        out.stderr,
+        format!("{}\n", s(31, "✗ snap: invalid command or arguments"))
+    );
+}
+
+#[test]
+fn terminal_merge_warning_is_styled() {
+    let sb = Sandbox::new();
+    let left = sb.path().join("left");
+    let right = sb.path().join("right");
+    std::fs::create_dir(&left).unwrap();
+    std::fs::create_dir(&right).unwrap();
+    sb.run_in(&left, &["init"]);
+    sb.run_in(&right, &["init"]);
+    sb.run_in(&left, &["config", "contributor.id", "a@x"]);
+    sb.run_in(&right, &["config", "contributor.id", "b@x"]);
+    std::fs::write(left.join("same"), "left\n").unwrap();
+    std::fs::write(right.join("same"), "right\n").unwrap();
+    sb.run_in(&left, &["commit", "left"]);
+    sb.run_in(&right, &["commit", "right"]);
+
+    let out = sb.run_color_in(&left, &["merge", right.to_str().unwrap()]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stderr,
+        format!(
+            "{} {}\n",
+            s(33, "⚠"),
+            s(33, "auto-resolved same: later-create-wins")
+        )
+    );
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{} {} {}\n",
+            s(32, "✓"),
+            s(1, "Merged"),
+            s(36, "(a@x->1,b@x->1)")
+        )
+    );
+}
+
+#[test]
+fn terminal_revert_success_line() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+    std::fs::write(repo.join("f.txt"), "changed\n").unwrap();
+    sb.run_in(&repo, &["commit", "second"]);
+
+    let out = sb.run_color_in(&repo, &["revert", "(a@x->1)"]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{} {} {}\n",
+            s(32, "✓"),
+            s(1, "Reverted"),
+            s(36, "(a@x->3)")
+        )
+    );
+}
+
+// ── SNAP_COLOR / NO_COLOR precedence ─────────────────────────────
+
+#[test]
+fn snap_color_never_produces_plain() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+
+    let out = sb.run_env_in(&repo, &["status"], &[("SNAP_COLOR", "never")]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "version (a@x->1)\n");
+}
+
+#[test]
+fn snap_color_auto_with_no_color_produces_plain() {
+    let sb = Sandbox::new();
+    let out = sb.run_env_in(
+        sb.path(),
+        &["--version"],
+        &[("SNAP_COLOR", "auto"), ("NO_COLOR", "1")],
+    );
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "snap 1.0.0\n");
+}
+
+#[test]
+fn snap_color_auto_no_color_empty_produces_plain() {
+    let sb = Sandbox::new();
+    let out = sb.run_env_in(
+        sb.path(),
+        &["--version"],
+        &[("SNAP_COLOR", "auto"), ("NO_COLOR", "")],
+    );
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "snap 1.0.0\n");
+}
+
+#[test]
+fn snap_color_unset_no_color_unset_piped_is_plain() {
+    let sb = Sandbox::new();
+    let out = sb.run_with_env(sb.path(), &["--version"], &[]);
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "snap 1.0.0\n");
+}
+
+#[test]
+fn snap_color_always_overrides_no_color() {
+    let sb = Sandbox::new();
+    let out = sb.run_env_in(
+        sb.path(),
+        &["--version"],
+        &[("SNAP_COLOR", "always"), ("NO_COLOR", "1")],
+    );
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, format!("{}\n", s(1, "snap 1.0.0")));
+}
+
+#[test]
+fn snap_color_invalid_value_errors() {
+    let sb = Sandbox::new();
+    let out = sb.run_env_in(sb.path(), &["--version"], &[("SNAP_COLOR", "sometimes")]);
+    assert_eq!(out.exit_code, 1);
+    assert_eq!(out.stdout, "");
+    assert_eq!(
+        out.stderr,
+        "snap: SNAP_COLOR must be auto, always, or never\n"
+    );
+}
+
+#[test]
+fn snap_color_invalid_error_is_always_plain() {
+    let sb = Sandbox::new();
+    let out = sb.run_env_in(sb.path(), &["--version"], &[("SNAP_COLOR", "maybe")]);
+    assert_eq!(out.exit_code, 1);
+    assert!(!out.stderr.contains("\x1b["));
 }
