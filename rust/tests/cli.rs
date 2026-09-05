@@ -949,3 +949,14 @@ fn merge_no_repo_errors() {
     assert_eq!(out.exit_code, 1);
     assert!(out.stderr.contains("not a Snap repository"));
 }
+
+#[test]
+fn merge_invalid_remote_exits_1() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let out = sb.run_in(&local, &["merge", "/tmp/nowhere"]);
+    assert_eq!(out.exit_code, 1, "stderr: {}", out.stderr);
+}

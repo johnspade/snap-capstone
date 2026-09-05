@@ -306,7 +306,10 @@ pub fn merge<O: std::io::Write, E: std::io::Write>(
 
     let cwd = std::env::current_dir().map_err(|e| SnapError::Internal(e.to_string()))?;
     let remote_root = cwd.join(remote_path);
-    let remote_repo = load_repo(&remote_root)?;
+    let remote_repo = load_repo(&remote_root).map_err(|e| match e {
+        SnapError::Internal(msg) => SnapError::Expected(msg),
+        SnapError::Expected(_) => e,
+    })?;
 
     let merged = union_repositories(&local_repo, &remote_repo)?;
 
