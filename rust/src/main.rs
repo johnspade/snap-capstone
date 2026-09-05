@@ -52,7 +52,8 @@ fn run<O: std::io::Write, E: std::io::Write>(
         ["diff", ..] => Err(SnapError::Expected(
             "usage: snap diff [<old> <new> [--repo <repository>]]".to_owned(),
         )),
-        ["--serve"] | ["--serve", _] => commands::require_repo_stub("serve"),
+        ["--serve"] => commands::serve(writer, None),
+        ["--serve", port] => commands::serve(writer, Some(port)),
         _ => Err(invalid_command_or_args()),
     }
 }

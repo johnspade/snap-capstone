@@ -1,7 +1,8 @@
 #![cfg(not(miri))]
 
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn snap_bin() -> std::path::PathBuf {
     let mut path = std::env::current_exe().unwrap();
@@ -48,6 +49,52 @@ impl Sandbox {
 
     fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    fn start_serve(&self, cwd: &Path, port: &str) -> SnapServer {
+        let mut cmd = Command::new(snap_bin());
+        cmd.args(["--serve", port])
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", self.dir.path().join("home"))
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Ok(val) = std::env::var("LLVM_PROFILE_FILE") {
+            cmd.env("LLVM_PROFILE_FILE", val);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut url_line = String::new();
+        reader.read_line(&mut url_line).unwrap();
+        let url = url_line.trim().to_owned();
+        SnapServer { child, url }
+    }
+}
+
+struct SnapServer {
+    child: std::process::Child,
+    url: String,
+}
+
+impl SnapServer {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn stop(self) -> Output {
+        Command::new("kill")
+            .args(["-s", "TERM", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        let output = self.child.wait_with_output().unwrap();
+        Output {
+            stdout: String::from_utf8(output.stdout).unwrap_or_default(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            exit_code: output.status.code().unwrap_or(-1),
+        }
     }
 }
 
@@ -1576,4 +1623,294 @@ fn merge_concurrent_creates_converge_bidirectionally() {
         alice_content, bob_content,
         "trees must converge after merge in both directions"
     );
+}
+
+// ── HTTP server ──────────────────────────────────────────────────
+
+#[test]
+fn serve_prints_url_and_exits_on_sigterm() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let server = sb.start_serve(&repo, "0");
+    assert!(
+        server.url().starts_with("http://127.0.0.1:"),
+        "url: {}",
+        server.url()
+    );
+    assert!(server.url().ends_with("/repository.json"));
+
+    let out = server.stop();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn serve_get_returns_repository_json() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "hello\n").unwrap();
+    sb.run_in(&repo, &["commit", "first"]);
+
+    let server = sb.start_serve(&repo, "0");
+
+    let agent = ureq::Agent::new_with_defaults();
+    let resp = agent.get(server.url()).call().unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(ct, "application/json; charset=utf-8");
+
+    let body: serde_json::Value = resp
+        .into_body()
+        .read_to_string()
+        .map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap())
+        .unwrap();
+    assert_eq!(body["format"], 1);
+    assert!(body["patches"].is_array());
+
+    server.stop();
+}
+
+#[test]
+fn serve_head_returns_empty_body() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let server = sb.start_serve(&repo, "0");
+
+    let agent = ureq::Agent::new_with_defaults();
+    let resp = agent.head(server.url()).call().unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().read_to_string().unwrap();
+    assert!(body.is_empty());
+
+    server.stop();
+}
+
+#[test]
+fn serve_unknown_path_returns_404() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let server = sb.start_serve(&repo, "0");
+    let base = server.url().strip_suffix("/repository.json").unwrap();
+    let url_404 = format!("{base}/nonexistent");
+
+    let agent = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let resp = agent.get(&url_404).call().unwrap();
+    assert_eq!(resp.status(), 404);
+
+    server.stop();
+}
+
+#[test]
+fn serve_wrong_method_returns_405() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let server = sb.start_serve(&repo, "0");
+
+    let agent = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+    let resp = agent.post(server.url()).send_empty().unwrap();
+    assert_eq!(resp.status(), 405);
+    let allow = resp.headers().get("allow").unwrap().to_str().unwrap();
+    assert_eq!(allow, "GET, HEAD");
+
+    server.stop();
+}
+
+#[test]
+fn serve_snapshot_is_immutable() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+    sb.run_in(&repo, &["config", "contributor.id", "a@x"]);
+    std::fs::write(repo.join("f.txt"), "one\n").unwrap();
+    sb.run_in(&repo, &["commit", "one"]);
+
+    let server = sb.start_serve(&repo, "0");
+
+    let agent = ureq::Agent::new_with_defaults();
+    let body1: serde_json::Value = {
+        let text = agent
+            .get(server.url())
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+
+    std::fs::write(repo.join("f.txt"), "two\n").unwrap();
+    sb.run_in(&repo, &["commit", "two"]);
+
+    let body2: serde_json::Value = {
+        let text = agent
+            .get(server.url())
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    };
+
+    assert_eq!(body1, body2, "snapshot must be immutable");
+
+    server.stop();
+}
+
+#[test]
+fn serve_invalid_repo_fails_at_startup() {
+    let sb = Sandbox::new();
+    let repo = sb.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    sb.run_in(&repo, &["init"]);
+
+    let snap_dir = repo.join(".snap");
+    std::fs::write(
+        snap_dir.join("repository.json"),
+        r#"{"format":1,"frontier":[],"patches":[],"extra":true}"#,
+    )
+    .unwrap();
+
+    let out = sb.run_in(&repo, &["--serve", "0"]);
+    assert_eq!(out.exit_code, 1);
+    assert!(!out.stderr.is_empty());
+}
+
+// ── HTTP client / remote merge ───────────────────────────────────
+
+#[test]
+fn remote_merge_end_to_end() {
+    let sb = Sandbox::new();
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "remote@x"]);
+    std::fs::write(remote.join("file.txt"), "remote\n").unwrap();
+    sb.run_in(&remote, &["commit", "remote"]);
+
+    let server = sb.start_serve(&remote, "0");
+
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let out = sb.run_in(&local, &["merge", server.url()]);
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.stdout, "(remote@x->1)\n");
+    assert_eq!(
+        std::fs::read_to_string(local.join("file.txt")).unwrap(),
+        "remote\n"
+    );
+
+    server.stop();
+}
+
+#[test]
+fn remote_diff_end_to_end() {
+    let sb = Sandbox::new();
+    let remote = sb.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    sb.run_in(&remote, &["init"]);
+    sb.run_in(&remote, &["config", "contributor.id", "remote@x"]);
+    std::fs::write(remote.join("file.txt"), "remote\n").unwrap();
+    sb.run_in(&remote, &["commit", "remote"]);
+
+    let server = sb.start_serve(&remote, "0");
+
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let out = sb.run_in(
+        &local,
+        &["diff", "()", "(remote@x->1)", "--repo", server.url()],
+    );
+    assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("+remote\n"));
+
+    server.stop();
+}
+
+#[test]
+fn remote_merge_malformed_json_rejected() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/bad");
+
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let body = "not-json";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let out = sb.run_in(&local, &["merge", &url]);
+    assert_eq!(out.exit_code, 1);
+    assert!(
+        out.stderr.contains("invalid JSON"),
+        "stderr: {}",
+        out.stderr
+    );
+
+    handle.join().unwrap();
+}
+
+#[test]
+fn remote_merge_non_200_rejected() {
+    let sb = Sandbox::new();
+    let local = sb.path().join("local");
+    std::fs::create_dir(&local).unwrap();
+    sb.run_in(&local, &["init"]);
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/redirect");
+
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let response = "HTTP/1.1 302 Found\r\nLocation: /other\r\nContent-Length: 0\r\n\r\n";
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let out = sb.run_in(&local, &["merge", &url]);
+    assert_eq!(out.exit_code, 1);
+    assert!(out.stderr.contains("HTTP 302"), "stderr: {}", out.stderr);
+
+    handle.join().unwrap();
 }

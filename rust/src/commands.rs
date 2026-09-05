@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use snap::config;
 use snap::filesystem::{self, Tree};
+use snap::http;
 use snap::replay;
 use snap::repository::{self, Change, Patch, Repository};
 use snap::text;
@@ -165,7 +166,7 @@ pub fn diff_cross_repo<O: std::io::Write, E: std::io::Write>(
     let new_version = parse_version(new_str)?;
     validate_version_known(&old_version, &local_repo)?;
 
-    let remote_repo = load_repo_from_path(repo_path)?;
+    let remote_repo = load_remote_repo(repo_path)?;
     validate_version_known(&new_version, &remote_repo)?;
     validate_shared_dots(&local_repo, &remote_repo)?;
 
@@ -292,7 +293,7 @@ pub fn revert<O: std::io::Write, E: std::io::Write>(
 
 pub fn merge<O: std::io::Write, E: std::io::Write>(
     writer: &mut Writer<O, E>,
-    remote_path: &str,
+    remote_operand: &str,
 ) -> Result<(), SnapError> {
     let repo_root = require_repo()?;
     let local_repo = load_repo(&repo_root)?;
@@ -304,12 +305,7 @@ pub fn merge<O: std::io::Write, E: std::io::Write>(
         return Err(SnapError::Expected("working tree is dirty".to_owned()));
     }
 
-    let cwd = std::env::current_dir().map_err(|e| SnapError::Internal(e.to_string()))?;
-    let remote_root = cwd.join(remote_path);
-    let remote_repo = load_repo(&remote_root).map_err(|e| match e {
-        SnapError::Internal(msg) => SnapError::Expected(msg),
-        SnapError::Expected(_) => e,
-    })?;
+    let remote_repo = load_remote_repo(remote_operand)?;
 
     let merged = union_repositories(&local_repo, &remote_repo)?;
 
@@ -363,9 +359,30 @@ fn union_repositories(local: &Repository, remote: &Repository) -> Result<Reposit
 
     Ok(Repository { frontier, patches })
 }
-pub fn require_repo_stub(_cmd: &str) -> Result<(), SnapError> {
-    require_repo()?;
-    Err(SnapError::Expected("not implemented".to_owned()))
+pub fn serve<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    port_str: Option<&str>,
+) -> Result<(), SnapError> {
+    let repo_root = require_repo()?;
+    let repo = load_repo(&repo_root).map_err(|e| match e {
+        SnapError::Internal(msg) => SnapError::Expected(msg),
+        SnapError::Expected(_) => e,
+    })?;
+    replay_to_frontier(&repo).map_err(|e| match e {
+        SnapError::Internal(msg) => SnapError::Expected(msg),
+        SnapError::Expected(_) => e,
+    })?;
+
+    let port: u16 = match port_str {
+        None => 8765,
+        Some(s) => s
+            .parse()
+            .map_err(|_| SnapError::Expected(format!("invalid port: {s}")))?,
+    };
+
+    http::serve(&repo, port, writer.stdout_mut()).map_err(SnapError::Expected)?;
+
+    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -430,14 +447,22 @@ fn validate_version_known(version: &Version, repo: &Repository) -> Result<(), Sn
     Ok(())
 }
 
-fn load_repo_from_path(path: &str) -> Result<Repository, SnapError> {
-    let repo_root = PathBuf::from(path);
-    if !repo_root.join(".snap").is_dir() {
-        return Err(SnapError::Expected(format!(
-            "not a Snap repository: {path}"
-        )));
+fn load_remote_repo(operand: &str) -> Result<Repository, SnapError> {
+    if http::is_http_url(operand) {
+        http::fetch_remote_repository(operand).map_err(SnapError::Expected)
+    } else {
+        let cwd = std::env::current_dir().map_err(|e| SnapError::Internal(e.to_string()))?;
+        let remote_root = cwd.join(operand);
+        if !remote_root.join(".snap").is_dir() {
+            return Err(SnapError::Expected(format!(
+                "not a Snap repository: {operand}"
+            )));
+        }
+        load_repo(&remote_root).map_err(|e| match e {
+            SnapError::Internal(msg) => SnapError::Expected(msg),
+            SnapError::Expected(_) => e,
+        })
     }
-    load_repo(&repo_root)
 }
 
 fn validate_shared_dots(local: &Repository, remote: &Repository) -> Result<(), SnapError> {
