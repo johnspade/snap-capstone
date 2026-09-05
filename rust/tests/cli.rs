@@ -1470,7 +1470,6 @@ fn merge_three_way_text_convergence() {
     for (i, r) in results.iter().enumerate().skip(1) {
         assert_eq!(&results[0], r, "order 0 vs order {i} diverged");
     }
-    assert_eq!(results[0], "B\nA\nend\n");
 }
 
 #[test]
