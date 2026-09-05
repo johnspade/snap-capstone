@@ -7,7 +7,7 @@ use snap::replay;
 use snap::repository::{self, Change, Patch, Repository};
 use snap::text;
 use snap::version::{ContributorId, Version};
-use snap::writer::Writer;
+use snap::writer::{ColorMode, Writer};
 
 use super::SnapError;
 
@@ -15,7 +15,11 @@ use super::SnapError;
 pub fn version<O: std::io::Write, E: std::io::Write>(
     writer: &mut Writer<O, E>,
 ) -> Result<(), SnapError> {
-    writer.stdout(&format!("snap {}\n", env!("CARGO_PKG_VERSION")));
+    let text = format!("snap {}", env!("CARGO_PKG_VERSION"));
+    match writer.stdout_mode() {
+        ColorMode::Plain => writer.stdout(&format!("{text}\n")),
+        ColorMode::Terminal => writer.stdout(&format!("{}\n", writer.style_out(1, &text))),
+    }
     Ok(())
 }
 
@@ -50,7 +54,7 @@ pub fn init<O: std::io::Write, E: std::io::Write>(
     std::fs::write(snap_dir.join("repository.json"), json)
         .map_err(|e| SnapError::Internal(e.to_string()))?;
 
-    writer.stdout("()\n");
+    write_success(writer, "Initialized repository", &repo.frontier);
     Ok(())
 }
 
@@ -86,13 +90,44 @@ pub fn status<O: std::io::Write, E: std::io::Write>(
     let working_tree = filesystem::scan_working_tree(&repo_root)
         .map_err(|e| SnapError::Expected(e.to_string()))?;
 
-    writer.stdout(&format!("version {}\n", repo.frontier));
-
     let mut changes = compute_working_changes(&current_tree, &working_tree);
     changes.sort_by(|a, b| a.1.cmp(&b.1));
 
-    for (code, path) in &changes {
-        writer.stdout(&format!("{code} {path}\n"));
+    match writer.stdout_mode() {
+        ColorMode::Plain => {
+            writer.stdout(&format!("version {}\n", repo.frontier));
+            for (code, path) in &changes {
+                writer.stdout(&format!("{code} {path}\n"));
+            }
+        }
+        ColorMode::Terminal => {
+            let header = format!(
+                "{}  {}\n\n",
+                writer.style_out(1, "Snap status"),
+                writer.style_out(36, &repo.frontier.to_string()),
+            );
+            writer.stdout(&header);
+            if changes.is_empty() {
+                writer.stdout(&format!(
+                    "  {} Working tree clean\n",
+                    writer.style_out(32, "✓"),
+                ));
+            } else {
+                for (code, path) in &changes {
+                    let (color, symbol, label) = match code {
+                        'A' => (32, "+", "added"),
+                        'D' => (31, "\u{2212}", "deleted"),
+                        'M' => (33, "~", "modified"),
+                        _ => (0, "?", "unknown"),
+                    };
+                    writer.stdout(&format!(
+                        "  {} {path} {}\n",
+                        writer.style_out(color, symbol),
+                        writer.style_out(2, &format!("({label})")),
+                    ));
+                }
+            }
+        }
     }
 
     Ok(())
@@ -107,14 +142,38 @@ pub fn log<O: std::io::Write, E: std::io::Write>(
     let order =
         replay::canonical_order(&repo.patches).map_err(|e| SnapError::Internal(e.to_string()))?;
 
-    for &idx in order.iter().rev() {
-        let patch = &repo.patches[idx];
-        let version = patch.result_version();
-        let escaped = escape_log_message(&patch.message);
-        writer.stdout(&format!(
-            "{version}\t{}\t{escaped}\n",
-            patch.author.as_str()
-        ));
+    let reversed: Vec<_> = order.iter().rev().copied().collect();
+
+    match writer.stdout_mode() {
+        ColorMode::Plain => {
+            for &idx in &reversed {
+                let patch = &repo.patches[idx];
+                let version = patch.result_version();
+                let escaped = escape_log_message(&patch.message);
+                writer.stdout(&format!(
+                    "{version}\t{}\t{escaped}\n",
+                    patch.author.as_str()
+                ));
+            }
+        }
+        ColorMode::Terminal => {
+            for (i, &idx) in reversed.iter().enumerate() {
+                if i > 0 {
+                    writer.stdout("\n");
+                }
+                let patch = &repo.patches[idx];
+                let version = patch.result_version();
+                let escaped = escape_log_message(&patch.message);
+                writer.stdout(&format!(
+                    "{} {}\n  {} {} {}\n",
+                    writer.style_out(36, "●"),
+                    writer.style_out(1, &escaped),
+                    writer.style_out(36, &version.to_string()),
+                    writer.style_out(2, "by"),
+                    writer.style_out(35, patch.author.as_str()),
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -228,7 +287,7 @@ pub fn commit<O: std::io::Write, E: std::io::Write>(
 
     atomic_write_repo(&repo_root, &new_repo)?;
 
-    writer.stdout(&format!("{new_version}\n"));
+    write_success(writer, "Committed", &new_version);
     Ok(())
 }
 
@@ -287,7 +346,7 @@ pub fn revert<O: std::io::Write, E: std::io::Write>(
         .map_err(|e| SnapError::Internal(e.to_string()))?;
     atomic_write_repo(&repo_root, &new_repo)?;
 
-    writer.stdout(&format!("{new_version}\n"));
+    write_success(writer, "Reverted", &new_version);
     Ok(())
 }
 
@@ -321,14 +380,14 @@ pub fn merge<O: std::io::Write, E: std::io::Write>(
         .collect();
 
     for (path, reason) in &new_warnings {
-        writer.stderr(&format!("warning: auto-resolved {path}: {reason}\n"));
+        writer.warning(&format!("auto-resolved {path}: {reason}"));
     }
 
     filesystem::materialize(&repo_root, &merged_result.tree)
         .map_err(|e| SnapError::Internal(e.to_string()))?;
     atomic_write_repo(&repo_root, &merged)?;
 
-    writer.stdout(&format!("{}\n", merged.frontier));
+    write_success(writer, "Merged", &merged.frontier);
     Ok(())
 }
 
@@ -383,6 +442,22 @@ pub fn serve<O: std::io::Write, E: std::io::Write>(
     http::serve(&repo, port, writer.stdout_mut()).map_err(SnapError::Expected)?;
 
     Ok(())
+}
+
+fn write_success<O: std::io::Write, E: std::io::Write>(
+    writer: &mut Writer<O, E>,
+    label: &str,
+    version: &Version,
+) {
+    match writer.stdout_mode() {
+        ColorMode::Plain => writer.stdout(&format!("{version}\n")),
+        ColorMode::Terminal => writer.stdout(&format!(
+            "{} {} {}\n",
+            writer.style_out(32, "✓"),
+            writer.style_out(1, label),
+            writer.style_out(36, &version.to_string()),
+        )),
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -651,11 +726,15 @@ fn format_diff_addition<O: std::io::Write, E: std::io::Write>(
     if text::is_text(content) {
         let s = std::str::from_utf8(content).expect("is_text guarantees valid UTF-8");
         let tokens = text::tokenize(s);
-        writer.stdout(&format!("--- /dev/null\n+++ b/{path}\n"));
-        writer.stdout(&format!("@@ -1,0 +1,{} @@\n", tokens.len()));
+        write_diff_line(writer, "--- /dev/null");
+        write_diff_line(writer, &format!("+++ b/{path}"));
+        write_diff_line(writer, &format!("@@ -1,0 +1,{} @@", tokens.len()));
         format_diff_tokens_inserted(writer, &tokens);
     } else {
-        writer.stdout(&format!("Binary files /dev/null and b/{path} differ\n"));
+        write_diff_line(
+            writer,
+            &format!("Binary files /dev/null and b/{path} differ"),
+        );
     }
 }
 
@@ -667,13 +746,17 @@ fn format_diff_deletion<O: std::io::Write, E: std::io::Write>(
     if text::is_text(content) {
         let s = std::str::from_utf8(content).expect("is_text guarantees valid UTF-8");
         let tokens = text::tokenize(s);
-        writer.stdout(&format!("--- a/{path}\n+++ /dev/null\n"));
-        writer.stdout(&format!("@@ -1,{} +1,0 @@\n", tokens.len()));
+        write_diff_line(writer, &format!("--- a/{path}"));
+        write_diff_line(writer, "+++ /dev/null");
+        write_diff_line(writer, &format!("@@ -1,{} +1,0 @@", tokens.len()));
         for token in &tokens {
             write_diff_token(writer, '-', token);
         }
     } else {
-        writer.stdout(&format!("Binary files a/{path} and /dev/null differ\n"));
+        write_diff_line(
+            writer,
+            &format!("Binary files a/{path} and /dev/null differ"),
+        );
     }
 }
 
@@ -693,15 +776,18 @@ fn format_diff_modification<O: std::io::Write, E: std::io::Write>(
         let new_tokens = text::tokenize(new_str);
         let edit = text::diff(&old_tokens, &new_tokens);
 
-        writer.stdout(&format!("--- a/{path}\n+++ b/{path}\n"));
-        writer.stdout(&format!(
-            "@@ -1,{} +1,{} @@\n",
-            old_tokens.len(),
-            new_tokens.len()
-        ));
+        write_diff_line(writer, &format!("--- a/{path}"));
+        write_diff_line(writer, &format!("+++ b/{path}"));
+        write_diff_line(
+            writer,
+            &format!("@@ -1,{} +1,{} @@", old_tokens.len(), new_tokens.len()),
+        );
         format_unified_edit(writer, &edit, &old_tokens);
     } else {
-        writer.stdout(&format!("Binary files a/{path} and b/{path} differ\n"));
+        write_diff_line(
+            writer,
+            &format!("Binary files a/{path} and b/{path} differ"),
+        );
     }
 }
 
@@ -748,9 +834,42 @@ fn write_diff_token<O: std::io::Write, E: std::io::Write>(
     prefix: char,
     token: &str,
 ) {
-    writer.stdout(&format!("{prefix}{token}"));
-    if !token.ends_with('\n') {
-        writer.stdout("\n\\ No newline at end of file\n");
+    if let Some(content) = token.strip_suffix('\n') {
+        write_diff_line(writer, &format!("{prefix}{content}"));
+    } else {
+        write_diff_line(writer, &format!("{prefix}{token}"));
+        write_diff_line(writer, "\\ No newline at end of file");
+    }
+}
+
+fn diff_line_sgr(line: &str) -> Option<u8> {
+    if line.starts_with("--- ") || line.starts_with("+++ ") {
+        Some(1)
+    } else if line.starts_with("@@ ") {
+        Some(36)
+    } else if line.starts_with('-') {
+        Some(31)
+    } else if line.starts_with('+') {
+        Some(32)
+    } else if line.starts_with("\\ ") {
+        Some(2)
+    } else if line.starts_with("Binary files ") {
+        Some(33)
+    } else {
+        None
+    }
+}
+
+fn write_diff_line<O: std::io::Write, E: std::io::Write>(writer: &mut Writer<O, E>, line: &str) {
+    match writer.stdout_mode() {
+        ColorMode::Plain => writer.stdout(&format!("{line}\n")),
+        ColorMode::Terminal => {
+            if let Some(code) = diff_line_sgr(line) {
+                writer.stdout(&format!("{}\n", writer.style_out(code, line)));
+            } else {
+                writer.stdout(&format!("{line}\n"));
+            }
+        }
     }
 }
 
@@ -1052,7 +1171,7 @@ mod tests {
     fn diff_text_addition() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_addition(&mut w, "f.txt", b"line\n");
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -1065,7 +1184,7 @@ mod tests {
     fn diff_binary_addition() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_addition(&mut w, "f.bin", &[0x00, 0xFF]);
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "Binary files /dev/null and b/f.bin differ\n");
@@ -1075,7 +1194,7 @@ mod tests {
     fn diff_empty_file_addition() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_addition(&mut w, "empty", b"");
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "--- /dev/null\n+++ b/empty\n@@ -1,0 +1,0 @@\n");
@@ -1085,7 +1204,7 @@ mod tests {
     fn diff_text_deletion() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_deletion(&mut w, "f.txt", b"line\n");
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -1098,7 +1217,7 @@ mod tests {
     fn diff_binary_deletion() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_deletion(&mut w, "f.bin", &[0x00, 0xFF]);
         let output = String::from_utf8(out).unwrap();
         assert_eq!(output, "Binary files a/f.bin and /dev/null differ\n");
@@ -1108,7 +1227,7 @@ mod tests {
     fn diff_no_trailing_newline() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_diff_addition(&mut w, "f.txt", b"no newline");
         let output = String::from_utf8(out).unwrap();
         assert_eq!(
@@ -1123,7 +1242,7 @@ mod tests {
     fn tree_diff_identical_trees_no_output() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         let tree = tree_from(&[("a.txt", b"hello\n")]);
         format_tree_diff(&mut w, &tree, &tree);
         assert!(out.is_empty());
@@ -1133,7 +1252,7 @@ mod tests {
     fn tree_diff_addition_deletion_modification() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         let old_tree = tree_from(&[("b.txt", b"old\n"), ("c.txt", b"keep\n")]);
         let new_tree = tree_from(&[("a.txt", b"new\n"), ("b.txt", b"changed\n")]);
         format_tree_diff(&mut w, &old_tree, &new_tree);
@@ -1147,7 +1266,7 @@ mod tests {
     fn tree_diff_paths_sorted() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         let old = tree_from(&[]);
         let new = tree_from(&[("z.txt", b"z\n"), ("a.txt", b"a\n")]);
         format_tree_diff(&mut w, &old, &new);
@@ -1161,7 +1280,7 @@ mod tests {
     fn tree_diff_binary_files() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         let old = tree_from(&[("f.bin", &[0x00, 0x01])]);
         let new = tree_from(&[("f.bin", &[0xFF, 0xFE])]);
         format_tree_diff(&mut w, &old, &new);
@@ -1173,7 +1292,7 @@ mod tests {
     fn tree_diff_empty_to_empty() {
         let mut out = Vec::new();
         let err = Vec::new();
-        let mut w = Writer::new(&mut out, err);
+        let mut w = Writer::new(&mut out, err, ColorMode::Plain, ColorMode::Plain);
         format_tree_diff(&mut w, &tree_from(&[]), &tree_from(&[]));
         assert!(out.is_empty());
     }
