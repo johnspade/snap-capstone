@@ -21,6 +21,14 @@ impl<O: Write, E: Write> Writer<O, E> {
     pub fn error(&mut self, detail: &str) {
         let _ = writeln!(self.stderr, "snap: {detail}");
     }
+
+    pub const fn stdout_mut(&mut self) -> &mut O {
+        &mut self.stdout
+    }
+
+    pub const fn stderr_mut(&mut self) -> &mut E {
+        &mut self.stderr
+    }
 }
 
 #[cfg(test)]
