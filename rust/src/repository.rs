@@ -15,7 +15,7 @@ const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
-    #[error("duplicate JSON key: {0}")]
+    #[error("duplicate JSON key {0}")]
     DuplicateJsonKey(String),
     #[error("unsupported format version: {0}")]
     UnsupportedFormat(u64),
@@ -69,7 +69,7 @@ pub enum ValidationError {
     FrontierReplayMismatch,
     #[error("unreachable patch: ({0}, {1})")]
     UnreachablePatch(String, u64),
-    #[error("edit script has adjacent operations of same kind")]
+    #[error("adjacent insert/delete/retain operations in edit script")]
     AdjacentSameKind,
     #[error("insert token is not canonical")]
     NonCanonicalInsertToken,
@@ -79,8 +79,13 @@ pub enum ValidationError {
 
 impl From<serde_json::Error> for ValidationError {
     fn from(e: serde_json::Error) -> Self {
-        Self::Json(e.to_string())
+        Self::Json(strip_serde_location(&e.to_string()))
     }
+}
+
+fn strip_serde_location(msg: &str) -> String {
+    msg.rfind(" at line ")
+        .map_or_else(|| msg.to_owned(), |idx| msg[..idx].to_owned())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -524,10 +529,77 @@ pub fn validate(repo: &Repository) -> Result<(), ValidationError> {
 /// Returns `ValidationError` if the JSON is malformed or the repository fails validation.
 pub fn parse(json: &str) -> Result<Repository, ValidationError> {
     check_duplicate_keys(json)?;
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| ValidationError::Json(strip_serde_location(&e.to_string())))?;
+    check_unknown_fields(&value)?;
     let raw: RawRepository = serde_json::from_str(json)?;
     let repo = raw.into_repository()?;
     validate(&repo)?;
     Ok(repo)
+}
+
+fn check_unknown_fields(value: &serde_json::Value) -> Result<(), ValidationError> {
+    const ROOT_KEYS: &[&str] = &["format", "frontier", "patches"];
+    const PATCH_KEYS: &[&str] = &["author", "revision", "base", "message", "changes"];
+
+    let obj = value
+        .as_object()
+        .ok_or_else(|| ValidationError::Json("expected object".to_owned()))?;
+
+    for key in obj.keys() {
+        if !ROOT_KEYS.contains(&key.as_str()) {
+            return Err(ValidationError::Json(format!(
+                "repository has unknown field: {key}"
+            )));
+        }
+    }
+
+    if let Some(patches) = obj.get("patches").and_then(|v| v.as_array()) {
+        for patch_val in patches {
+            if let Some(p) = patch_val.as_object() {
+                for key in p.keys() {
+                    if !PATCH_KEYS.contains(&key.as_str()) {
+                        return Err(ValidationError::Json(format!(
+                            "patch has unknown field: {key}"
+                        )));
+                    }
+                }
+                check_change_unknown_fields(p)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_change_unknown_fields(
+    patch_obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ValidationError> {
+    let Some(changes) = patch_obj.get("changes").and_then(|v| v.as_array()) else {
+        return Ok(());
+    };
+
+    for change_val in changes {
+        let Some(c) = change_val.as_object() else {
+            continue;
+        };
+        let change_type = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let known_keys: &[&str] = match change_type {
+            "text" => &["type", "path", "edit"],
+            "put" => &["type", "path", "content"],
+            "delete" => &["type", "path"],
+            _ => continue,
+        };
+        for key in c.keys() {
+            if !known_keys.contains(&key.as_str()) {
+                return Err(ValidationError::Json(format!(
+                    "change has unknown field: {key}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn check_duplicate_keys(json: &str) -> Result<(), ValidationError> {
@@ -595,7 +667,6 @@ fn check_duplicate_keys(json: &str) -> Result<(), ValidationError> {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawRepository {
     format: u64,
     frontier: Version,
@@ -620,7 +691,6 @@ impl RawRepository {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawPatch {
     author: String,
     revision: SafeInt,
@@ -691,7 +761,7 @@ impl<'de> Deserialize<'de> for SafeInt {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[serde(tag = "type")]
 enum RawChange {
     #[serde(rename = "text")]
     Text { path: String, edit: Vec<RawEditOp> },
@@ -770,7 +840,7 @@ impl<'de> Deserialize<'de> for RawEditOp {
                     "insert" => {
                         let tokens: Vec<String> = map.next_value()?;
                         if tokens.is_empty() {
-                            return Err(de::Error::custom("insert is empty"));
+                            return Err(de::Error::custom("edit operation insert is empty"));
                         }
                         for token in &tokens {
                             if token.is_empty() {

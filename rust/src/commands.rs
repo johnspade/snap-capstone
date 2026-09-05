@@ -244,7 +244,8 @@ pub fn commit<O: std::io::Write, E: std::io::Write>(
     let contributor = resolve_contributor(&repo_root)?;
     let repo = load_repo(&repo_root)?;
 
-    repository::validate_commit_message(message).map_err(|e| SnapError::Expected(e.to_string()))?;
+    repository::validate_commit_message(message)
+        .map_err(|_| SnapError::Expected("invalid commit message".to_owned()))?;
 
     let current_tree = replay_to_frontier(&repo)?;
     let working_tree = filesystem::scan_working_tree(&repo_root)
@@ -487,7 +488,7 @@ fn load_repo(repo_root: &Path) -> Result<Repository, SnapError> {
     let json_path = repo_root.join(".snap/repository.json");
     let json =
         std::fs::read_to_string(&json_path).map_err(|e| SnapError::Internal(e.to_string()))?;
-    repository::parse(&json).map_err(|e| SnapError::Internal(e.to_string()))
+    repository::parse(&json).map_err(|e| SnapError::Expected(e.to_string()))
 }
 
 fn replay_to_frontier(repo: &Repository) -> Result<Tree, SnapError> {
