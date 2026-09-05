@@ -12,6 +12,22 @@ scripts. Set `SNAP_COLOR=always` to preserve the terminal presentation through
 a pipe, `SNAP_COLOR=never` to disable it, or `NO_COLOR=1` for Snap's
 conservative plain-output opt-out.
 
+## Built with AI agents
+
+The Rust implementation was developed end-to-end with AI coding agents. The
+process started with a grilling session that produced an
+[architecture decision record](docs/adr/0001-rust-implementation-architecture.md),
+which was then broken into 16 [issues](.scratch/rust-implementation/issues/) with
+a dependency-aware [roadmap](.scratch/rust-implementation/ROADMAP.md). The roadmap
+identified seven waves of work with up to three parallel tracks, letting agents
+work on independent modules simultaneously.
+
+Guardrails kept quality high throughout: `clippy` and `rustfmt` in CI, 315 unit
+tests (including property tests via `proptest`), 28 language-neutral acceptance
+tests covering E2E and golden-output scenarios, and
+[mutation testing](https://github.com/cargo-mutants/cargo-mutants) to verify the
+test suite catches real regressions.
+
 ## At a glance
 
 - **Focus:** causal modelling, canonical data formats, deterministic diffs,
